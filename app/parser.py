@@ -1,3 +1,9 @@
+"""
+parser.py — HuggingFace Transformers + AWQ inference
+Model  : cyankiwi/Qwen3.5-27B-AWQ-4bit  (text-only, standard Qwen3 arch)
+VRAM   : ~18-20 GB on RTX 4090
+"""
+
 import os, re, json, logging, time, torch
 from dotenv import load_dotenv
 
@@ -5,14 +11,16 @@ load_dotenv()
 log = logging.getLogger("bank_ai.parser")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-MODEL_ID   = os.getenv("MODEL_ID",   "cpatonn/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-AWQ-4bit")
-LOCAL_PATH = os.getenv("MODEL_PATH", "/workspace/models/Qwen3.5-27B-Claude-AWQ")
+MODEL_ID   = os.getenv("MODEL_ID",   "cyankiwi/Qwen3.5-27B-AWQ-4bit")
+LOCAL_PATH = os.getenv("MODEL_PATH", "/workspace/models/Qwen3.5-27B-AWQ")
 HF_TOKEN   = os.getenv("HF_TOKEN")
 HF_HOME    = os.getenv("HF_HOME", "/workspace/models")
 
-os.environ["HF_HOME"]             = HF_HOME
-os.environ["TRANSFORMERS_CACHE"]  = HF_HOME
-os.environ["HF_HUB_CACHE"]        = HF_HOME
+os.environ["HF_HOME"]            = HF_HOME
+os.environ["TRANSFORMERS_CACHE"] = HF_HOME
+os.environ["HF_HUB_CACHE"]       = HF_HOME
+# Prevent VRAM fragmentation OOM
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 MAX_NEW_TOKENS   = int(os.getenv("MAX_NEW_TOKENS",   "8192"))
 MAX_HEADER_CHARS = int(os.getenv("MAX_HEADER_CHARS", "4000"))
@@ -36,7 +44,6 @@ def _load_model():
         login(token=HF_TOKEN)
         log.info("HuggingFace login OK")
 
-    # Use local path if downloaded, else pull from Hub
     load_from = LOCAL_PATH if os.path.exists(
         os.path.join(LOCAL_PATH, "config.json")
     ) else MODEL_ID
@@ -44,25 +51,29 @@ def _load_model():
     log.info(f"Loading model from: {load_from}")
 
     _tokenizer = AutoTokenizer.from_pretrained(
-        load_from, trust_remote_code=True
+        load_from,
+        trust_remote_code=True
     )
 
     _model = AutoModelForCausalLM.from_pretrained(
         load_from,
-        torch_dtype=torch.float16,
-        device_map={"": 0},          # all layers on GPU 0
+        dtype=torch.float16,          # fixed: dtype not torch_dtype
+        device_map={"": 0},
         trust_remote_code=True,
     )
     _model.eval()
 
     free, total = torch.cuda.mem_get_info(0)
-    log.info(f"Model ready ✓  VRAM used: {round((total-free)/1e9,2)} / {round(total/1e9,2)} GB")
+    used = round((total - free) / 1e9, 2)
+    tot  = round(total / 1e9, 2)
+    log.info(f"Model ready ✓  VRAM used: {used} / {tot} GB")
 
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 HEADER_PROMPT = """\
 You are a bank statement parser. Extract ONLY account/header details from the text below.
-Return ONLY valid JSON with this exact schema — leave fields as "" if not found. No explanation.
+Return ONLY valid JSON with this exact schema — leave fields as "" if not found.
+No explanation. No markdown. Just the JSON object.
 
 {
   "bank_name": "", "branch_name": "", "bank_type": "",
@@ -82,9 +93,9 @@ TEXT:
 
 TRANSACTION_PROMPT = """\
 You are a bank transaction extractor. Extract ALL transactions from the text below.
-Return ONLY a valid JSON array — no wrapper object, no explanation.
+Return ONLY a valid JSON array — no wrapper object, no explanation, no markdown.
 
-Each item must follow this schema:
+Each item must follow this exact schema:
 {
   "date": "", "value_date": "", "description": "", "narration": "",
   "cheque_no": "", "reference_no": "", "transaction_type": "",
@@ -93,13 +104,20 @@ Each item must follow this schema:
 
 Rules:
 - date / value_date: YYYY-MM-DD (convert from DD/MM/YYYY or DD-MMM-YYYY)
-- transaction_type: exactly "DEBIT" or "CREDIT" — infer if column missing
+- transaction_type: exactly "DEBIT" or "CREDIT" — infer from context if column missing
 - debit and credit are mutually exclusive per row
-- amounts: strip symbols/commas — plain number string (e.g. "12500.00")
-- Include EVERY transaction row — do not skip any
+- amounts: strip all currency symbols and commas — plain number string (e.g. "12500.00")
+- Include EVERY transaction row — do NOT skip any
 
 TEXT:
 """
+
+
+# ── Strip <think>...</think> blocks (Qwen3 thinking mode) ─────────────────────
+def _strip_thinking(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"</think>", "", text)
+    return text.strip()
 
 
 # ── Core inference ─────────────────────────────────────────────────────────────
@@ -107,22 +125,41 @@ def _infer(prompt: str, text: str, label: str = "") -> str:
     _load_model()
 
     messages = [{"role": "user", "content": prompt + text}]
-    formatted = _tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+
+    # enable_thinking=False suppresses <think> block — faster + cleaner JSON
+    try:
+        formatted = _tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        # Fallback if this tokenizer doesn't support enable_thinking
+        formatted = _tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
     inputs    = _tokenizer(formatted, return_tensors="pt").to("cuda")
     input_len = inputs["input_ids"].shape[1]
 
-    # Safety: truncate if over context limit
+    # Safety: truncate if over context window
     max_ctx = MAX_CONTEXT - MAX_NEW_TOKENS - 128
     if input_len > max_ctx:
-        ratio    = (max_ctx / input_len) * 0.9
-        text     = text[:int(len(text) * ratio)]
-        log.warning(f"[{label}] Over limit ({input_len} tokens) — truncated to {max_ctx}")
+        ratio = (max_ctx / input_len) * 0.9
+        text  = text[:int(len(text) * ratio)]
+        log.warning(f"[{label}] Over limit ({input_len} tokens) — truncating to fit context")
         messages  = [{"role": "user", "content": prompt + text}]
-        formatted = _tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        try:
+            formatted = _tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+        except TypeError:
+            formatted = _tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
         inputs    = _tokenizer(formatted, return_tensors="pt").to("cuda")
         input_len = inputs["input_ids"].shape[1]
 
@@ -133,24 +170,27 @@ def _infer(prompt: str, text: str, label: str = "") -> str:
     with torch.no_grad():
         outputs = _model.generate(
             **inputs,
-            max_new_tokens   = MAX_NEW_TOKENS,
-            do_sample        = False,
+            max_new_tokens     = MAX_NEW_TOKENS,
+            do_sample          = False,
             repetition_penalty = 1.05,
-            pad_token_id     = _tokenizer.eos_token_id,
-            eos_token_id     = _tokenizer.eos_token_id,
+            pad_token_id       = _tokenizer.eos_token_id,
+            eos_token_id       = _tokenizer.eos_token_id,
         )
+
     elapsed    = time.time() - t0
     new_tokens = outputs[0][input_len:]
-    result     = _tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    raw_result = _tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    result     = _strip_thinking(raw_result)
 
-    log.info(f"[{label}] {len(new_tokens)} tokens in {elapsed:.2f}s ({len(new_tokens)/max(elapsed,0.1):.0f} t/s)")
+    tps = len(new_tokens) / max(elapsed, 0.1)
+    log.info(f"[{label}] {len(new_tokens)} tokens in {elapsed:.2f}s ({tps:.0f} t/s)")
     return result
 
 
 # ── JSON extraction ────────────────────────────────────────────────────────────
 def _extract_json(raw: str, expect: str = "object", label: str = "") -> any:
-    raw   = re.sub(r"```json\s*", "", raw)
-    raw   = re.sub(r"```\s*",     "", raw).strip()
+    raw = re.sub(r"```json\s*", "", raw)
+    raw = re.sub(r"```\s*",     "", raw).strip()
 
     open_c  = "[" if expect == "array" else "{"
     close_c = "]" if expect == "array" else "}"
@@ -167,7 +207,7 @@ def _extract_json(raw: str, expect: str = "object", label: str = "") -> any:
         log.info(f"[{label}] ✓ Parsed — {'items: '+str(count) if expect=='array' else 'fields: '+str(count)}")
         return parsed
     except json.JSONDecodeError as e:
-        log.error(f"[{label}] JSON error: {e}\n{raw[start:start+500]}")
+        log.error(f"[{label}] JSON decode error: {e}\n{raw[start:start+500]}")
         return [] if expect == "array" else {}
 
 
@@ -183,6 +223,6 @@ def parse_header(text: str) -> dict:
 
 def parse_transactions(text: str) -> list:
     chunk = text[:MAX_TXN_CHARS]
-    log.info(f"Transactions: sending {len(chunk):,} / {len(text):,} chars")
+    log.info(f"Transactions: sending {len(chunk):,} / {len(text):,} chars to LLM")
     raw = _infer(TRANSACTION_PROMPT, chunk, label="transactions")
     return _extract_json(raw, expect="array", label="transactions")
