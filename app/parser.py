@@ -1,7 +1,8 @@
 """
-parser.py — HuggingFace Transformers + AWQ inference
-Model  : cyankiwi/Qwen3.5-27B-AWQ-4bit  (text-only, standard Qwen3 arch)
-VRAM   : ~18-20 GB on RTX 4090
+parser.py — HuggingFace Transformers + AutoAWQ inference
+Model  : QuantTrio/Qwen3.5-27B-AWQ  (text-only, standard Qwen3 arch, AWQ INT4)
+VRAM   : ~17-19 GB on RTX 4090
+Backend: transformers + autoawq (no llama-cpp needed)
 """
 
 import os, re, json, logging, time, torch
@@ -11,7 +12,7 @@ load_dotenv()
 log = logging.getLogger("bank_ai.parser")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-MODEL_ID   = os.getenv("MODEL_ID",   "cyankiwi/Qwen3.5-27B-AWQ-4bit")
+MODEL_ID   = os.getenv("MODEL_ID",   "QuantTrio/Qwen3.5-27B-AWQ")
 LOCAL_PATH = os.getenv("MODEL_PATH", "/workspace/models/Qwen3.5-27B-AWQ")
 HF_TOKEN   = os.getenv("HF_TOKEN")
 HF_HOME    = os.getenv("HF_HOME", "/workspace/models")
@@ -19,7 +20,6 @@ HF_HOME    = os.getenv("HF_HOME", "/workspace/models")
 os.environ["HF_HOME"]            = HF_HOME
 os.environ["TRANSFORMERS_CACHE"] = HF_HOME
 os.environ["HF_HUB_CACHE"]       = HF_HOME
-# Prevent VRAM fragmentation OOM
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 MAX_NEW_TOKENS   = int(os.getenv("MAX_NEW_TOKENS",   "8192"))
@@ -50,6 +50,20 @@ def _load_model():
 
     log.info(f"Loading model from: {load_from}")
 
+    # Verify architecture before loading to catch wrong model early
+    import json as _json
+    cfg_path = os.path.join(load_from, "config.json")
+    if os.path.exists(cfg_path):
+        cfg = _json.load(open(cfg_path))
+        model_type = cfg.get("model_type", "")
+        has_vision = "vision" in str(cfg).lower() or "visual" in str(cfg).lower()
+        if has_vision:
+            raise RuntimeError(
+                f"WRONG MODEL: {load_from} is a vision-language model ({model_type}). "
+                "Use QuantTrio/Qwen3.5-27B-AWQ (text-only)."
+            )
+        log.info(f"Architecture check OK — model_type: {model_type}")
+
     _tokenizer = AutoTokenizer.from_pretrained(
         load_from,
         trust_remote_code=True
@@ -57,8 +71,8 @@ def _load_model():
 
     _model = AutoModelForCausalLM.from_pretrained(
         load_from,
-        dtype=torch.float16,          # fixed: dtype not torch_dtype
-        device_map={"": 0},
+        dtype=torch.float16,
+        device_map={"": 0},        # all layers → GPU 0
         trust_remote_code=True,
     )
     _model.eval()
@@ -126,7 +140,7 @@ def _infer(prompt: str, text: str, label: str = "") -> str:
 
     messages = [{"role": "user", "content": prompt + text}]
 
-    # enable_thinking=False suppresses <think> block — faster + cleaner JSON
+    # enable_thinking=False — suppress reasoning block, output pure JSON
     try:
         formatted = _tokenizer.apply_chat_template(
             messages,
@@ -135,7 +149,6 @@ def _infer(prompt: str, text: str, label: str = "") -> str:
             enable_thinking=False,
         )
     except TypeError:
-        # Fallback if this tokenizer doesn't support enable_thinking
         formatted = _tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -151,7 +164,7 @@ def _infer(prompt: str, text: str, label: str = "") -> str:
         ratio = (max_ctx / input_len) * 0.9
         text  = text[:int(len(text) * ratio)]
         log.warning(f"[{label}] Over limit ({input_len} tokens) — truncating to fit context")
-        messages  = [{"role": "user", "content": prompt + text}]
+        messages = [{"role": "user", "content": prompt + text}]
         try:
             formatted = _tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
@@ -213,15 +226,18 @@ def _extract_json(raw: str, expect: str = "object", label: str = "") -> any:
 
 # ── Public interface ───────────────────────────────────────────────────────────
 def load_model():
+    """Pre-load model into VRAM at startup (called from main.py lifespan)."""
     _load_model()
 
 
 def parse_header(text: str) -> dict:
+    """Extract account/header details from raw statement text."""
     raw = _infer(HEADER_PROMPT, text[:MAX_HEADER_CHARS], label="header")
     return _extract_json(raw, expect="object", label="header")
 
 
 def parse_transactions(text: str) -> list:
+    """Extract all transaction rows from raw statement text."""
     chunk = text[:MAX_TXN_CHARS]
     log.info(f"Transactions: sending {len(chunk):,} / {len(text):,} chars to LLM")
     raw = _infer(TRANSACTION_PROMPT, chunk, label="transactions")
