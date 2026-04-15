@@ -12,7 +12,7 @@ load_dotenv()
 log = logging.getLogger("bank_ai.parser")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-MODEL_PATH     = os.getenv("MODEL_PATH",     "/workspace/models/Qwen3.5-27B.Q4_K_M.gguf")
+MODEL_PATH     = os.getenv("MODEL_PATH",     "/workspace/models/Qwen3.5-27B-Q4_K_M.gguf")
 N_GPU_LAYERS   = int(os.getenv("N_GPU_LAYERS",   "-1"))   # -1 = all layers on GPU
 N_CTX          = int(os.getenv("N_CTX",          "32768"))
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS",  "8192"))
