@@ -1,56 +1,76 @@
-import os, re, json, logging, torch, time
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from huggingface_hub import login
+"""
+parser.py — GGUF inference via llama-cpp-python
+Model : Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-GGUF
+Quant : Q4_K_M  (~17 GB on disk, ~22 GB VRAM on 4090)
+Backend: llama-cpp-python with CUDA (n_gpu_layers=-1 = all layers on GPU)
+
+No token output limits — context window is 32 768 tokens; output can fill
+whatever remains after the prompt (up to ~28 000 new tokens if needed).
+"""
+
+import os, re, json, logging, time
 from dotenv import load_dotenv
 
 load_dotenv()
 log = logging.getLogger("bank_ai.parser")
 
-HF_HOME  = os.getenv("HF_HOME", "/workspace/models")
-MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
+# ── Config ─────────────────────────────────────────────────────────────────────
+MODEL_PATH   = os.getenv(
+    "GGUF_MODEL_PATH",
+    "/workspace/models/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Q4_K_M.gguf"
+)
+N_CTX        = int(os.getenv("N_CTX",        "32768"))   # full context window
+N_GPU_LAYERS = int(os.getenv("N_GPU_LAYERS", "-1"))       # -1 = all layers → GPU
+N_THREADS    = int(os.getenv("N_THREADS",    "8"))
+TEMPERATURE  = float(os.getenv("TEMPERATURE","0.0"))      # deterministic for JSON
 
-os.environ["HF_HOME"]            = HF_HOME
-os.environ["TRANSFORMERS_CACHE"] = HF_HOME
-os.environ["HF_HUB_CACHE"]       = HF_HOME
+# No hard cap — let the model finish naturally.
+# 0 means "use whatever fits in the remaining context window"
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "0"))
 
-_tokenizer = None
-_model     = None
+# Max chars sent to the model per call
+MAX_HEADER_CHARS = int(os.getenv("MAX_HEADER_CHARS", "4000"))
+MAX_TXN_CHARS    = int(os.getenv("MAX_TXN_CHARS",    "30000"))
 
+_llm = None   # global model handle
+
+
+# ── Model loader ───────────────────────────────────────────────────────────────
 def _load_model():
-    global _tokenizer, _model
-    if _model is not None:
+    global _llm
+    if _llm is not None:
         return
 
-    hf_token = os.getenv("HF_TOKEN")
-    if hf_token:
-        login(token=hf_token)
-        log.info("HuggingFace login OK")
+    from llama_cpp import Llama
 
-    LOCAL_PATH = "/workspace/models/qwen2.5-7b"
-    LOAD_FROM  = LOCAL_PATH if os.path.exists(os.path.join(LOCAL_PATH, "config.json")) else MODEL_ID
-    log.info(f"Loading model from: {LOAD_FROM}")
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"GGUF model not found at: {MODEL_PATH}\n"
+            "Download with:\n"
+            "  huggingface-cli download Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-GGUF "
+            "Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Q4_K_M.gguf "
+            "--local-dir /workspace/models"
+        )
 
-    _tokenizer = AutoTokenizer.from_pretrained(LOAD_FROM, trust_remote_code=True)
-    _model = AutoModelForCausalLM.from_pretrained(
-        LOAD_FROM,
-        dtype=torch.float16,
-        device_map={"": 0},
-        trust_remote_code=True,
+    log.info(f"Loading GGUF model: {MODEL_PATH}")
+    log.info(f"  n_ctx={N_CTX}  n_gpu_layers={N_GPU_LAYERS}  temp={TEMPERATURE}")
+
+    _llm = Llama(
+        model_path    = MODEL_PATH,
+        n_ctx         = N_CTX,
+        n_gpu_layers  = N_GPU_LAYERS,   # all layers on VRAM
+        n_threads     = N_THREADS,
+        verbose       = False,
+        use_mlock     = True,           # pin model weights in RAM, no swapping
+        flash_attn    = True,           # FlashAttention-2 — faster + less VRAM
     )
-    _model.eval()
-
-    free, total = torch.cuda.mem_get_info(0)
-    log.info(f"Model ready ✓  VRAM: {round((total-free)/1e9,2)} / {round(total/1e9,2)} GB")
+    log.info("GGUF model ready ✓")
 
 
-# ── No restrictions on RunPod 24GB ────────────────────────────────────────────
-MAX_CONTEXT      = 32768   # Qwen2.5 supports up to 128K — 32K is safe on 24GB
-MAX_NEW_TOKENS   = 81920    # enough for 100+ transactions
-MAX_HEADER_CHARS = 30000
-MAX_TXN_CHARS    = 20000   # send full document
-
-HEADER_PROMPT = """You are a bank statement parser. Extract ONLY account/header details from the text below.
-Return ONLY valid JSON with this exact schema — leave fields as "" if not found. No explanation.
+# ── Prompts ────────────────────────────────────────────────────────────────────
+HEADER_PROMPT = """\
+You are a bank statement parser. Extract ONLY account/header details from the text below.
+Return ONLY valid JSON with this exact schema — leave fields as "" if not found. No explanation, no markdown.
 
 {
   "bank_name": "", "branch_name": "", "bank_type": "",
@@ -63,15 +83,16 @@ Return ONLY valid JSON with this exact schema — leave fields as "" if not foun
 
 Rules:
 - statement_from / statement_to: YYYY-MM-DD format
-- opening_balance / closing_balance: plain number string (e.g. "12500.00")
+- opening_balance / closing_balance: plain number string, no symbols (e.g. "12500.00")
 
 TEXT:
 """
 
-TRANSACTION_PROMPT = """You are a bank transaction extractor. Extract ALL transactions from the text below.
-Return ONLY a valid JSON array — no wrapper object, no explanation.
+TRANSACTION_PROMPT = """\
+You are a bank transaction extractor. Extract ALL transactions from the text below.
+Return ONLY a valid JSON array — no wrapper object, no markdown, no explanation.
 
-Each item must follow this schema:
+Each item must follow this exact schema:
 {
   "date": "", "value_date": "", "description": "", "narration": "",
   "cheque_no": "", "reference_no": "", "transaction_type": "",
@@ -80,74 +101,96 @@ Each item must follow this schema:
 
 Rules:
 - date / value_date: YYYY-MM-DD (convert from DD/MM/YYYY or DD-MMM-YYYY)
-- transaction_type: exactly "DEBIT" or "CREDIT"
+- transaction_type: exactly "DEBIT" or "CREDIT" — infer from context if column is missing
 - debit and credit are mutually exclusive per row
-- amounts: strip symbols/commas — plain number string (e.g. "12500.00")
-- Include EVERY transaction row — do not skip any
+- amounts: strip all currency symbols and commas — plain number string (e.g. "12500.00")
+- Include EVERY transaction row — do NOT skip any, including opening/closing balance rows
+- Output must be a single JSON array starting with [ and ending with ]
 
 TEXT:
 """
 
-def _infer(prompt: str, text_chunk: str, label: str = "") -> str:
+
+# ── Core inference ─────────────────────────────────────────────────────────────
+def _infer(prompt: str, text: str, label: str = "") -> str:
     _load_model()
-    messages  = [{"role": "user", "content": prompt + text_chunk}]
-    formatted = _tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+
+    full_prompt = (
+        "<|im_start|>system\n"
+        "You are a precise financial data extraction AI. Always return valid JSON only.\n"
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"{prompt}{text}\n"
+        "<|im_end|>\n"
+        "<|im_start|>assistant\n"
     )
-    inputs    = _tokenizer(formatted, return_tensors="pt").to("cuda")
-    input_len = inputs["input_ids"].shape[1]
 
-    # Safety guard — truncate only if truly over limit
-    max_input = MAX_CONTEXT - MAX_NEW_TOKENS - 128
-    if input_len > max_input:
-        log.warning(f"[{label}] Over limit: {input_len} tokens → truncating to {max_input}")
-        ratio      = (max_input / input_len) * 0.9
-        text_chunk = text_chunk[:int(len(text_chunk) * ratio)]
-        messages   = [{"role": "user", "content": prompt + text_chunk}]
-        formatted  = _tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs     = _tokenizer(formatted, return_tensors="pt").to("cuda")
-        input_len  = inputs["input_ids"].shape[1]
+    # Calculate safe max tokens — fill remaining context window
+    # Rough estimate: 1 token ≈ 3 chars
+    prompt_tokens    = len(full_prompt) // 3
+    remaining_tokens = N_CTX - prompt_tokens - 64
+    max_tokens       = MAX_NEW_TOKENS if MAX_NEW_TOKENS > 0 else max(remaining_tokens, 1024)
 
-    log.info(f"[{label}] Input: {input_len} tokens  Max new: {MAX_NEW_TOKENS}")
-    torch.cuda.empty_cache()
+    log.info(f"[{label}] Prompt ~{prompt_tokens} tokens | Max new tokens: {max_tokens}")
 
     t0 = time.time()
-    with torch.no_grad():
-        outputs = _model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False,
-            repetition_penalty=1.05,
-            pad_token_id=_tokenizer.eos_token_id,
-            eos_token_id=_tokenizer.eos_token_id,
-        )
-    elapsed    = time.time() - t0
-    new_tokens = outputs[0][input_len:]
-    result     = _tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-    log.info(f"[{label}] {len(new_tokens)} tokens in {elapsed:.2f}s = {len(new_tokens)/max(elapsed,0.1):.0f} t/s")
+    output = _llm(
+        full_prompt,
+        max_tokens   = max_tokens,
+        temperature  = TEMPERATURE,
+        repeat_penalty = 1.05,
+        stop         = ["<|im_end|>", "<|endoftext|>"],
+        echo         = False,
+    )
+    elapsed = time.time() - t0
+
+    result      = output["choices"][0]["text"].strip()
+    tokens_used = output.get("usage", {}).get("completion_tokens", len(result) // 3)
+    log.info(f"[{label}] Done in {elapsed:.2f}s | ~{tokens_used} output tokens | {tokens_used/max(elapsed,0.1):.0f} t/s")
     return result
 
+
+# ── JSON extraction ────────────────────────────────────────────────────────────
 def _extract_json(raw: str, expect: str = "object", label: str = "") -> any:
-    raw   = raw.replace("```json", "").replace("```", "").strip()
-    start = raw.find("[" if expect == "array" else "{")
-    end   = raw.rfind("]" if expect == "array" else "}")
+    # Strip markdown fences if the model added them
+    raw = re.sub(r"```json\s*", "", raw)
+    raw = re.sub(r"```\s*",     "", raw)
+    raw = raw.strip()
+
+    open_char  = "[" if expect == "array" else "{"
+    close_char = "]" if expect == "array" else "}"
+
+    start = raw.find(open_char)
+    end   = raw.rfind(close_char)
+
     if start == -1 or end <= start:
-        log.error(f"[{label}] No valid JSON {expect} found.\nRaw (first 500):\n{raw[:500]}")
+        log.error(f"[{label}] No valid JSON {expect} in output.\nRaw (first 600):\n{raw[:600]}")
         return [] if expect == "array" else {}
+
+    snippet = raw[start:end + 1]
     try:
-        parsed = json.loads(raw[start:end+1])
-        log.info(f"[{label}] Parsed OK — {'items: '+str(len(parsed)) if expect=='array' else 'fields: '+str(len(parsed))}")
+        parsed = json.loads(snippet)
+        count  = len(parsed) if isinstance(parsed, list) else len(parsed.keys())
+        log.info(f"[{label}] ✓ Parsed — {'items: ' + str(count) if expect == 'array' else 'fields: ' + str(count)}")
         return parsed
     except json.JSONDecodeError as e:
-        log.error(f"[{label}] JSON decode error: {e}\nRaw snippet:\n{raw[start:start+400]}")
+        log.error(f"[{label}] JSON decode error: {e}\nSnippet start:\n{snippet[:500]}")
         return [] if expect == "array" else {}
+
+
+# ── Public interface ───────────────────────────────────────────────────────────
+def load_model():
+    """Called at app startup to pre-load the model into VRAM."""
+    _load_model()
+
 
 def parse_header(text: str) -> dict:
     raw = _infer(HEADER_PROMPT, text[:MAX_HEADER_CHARS], label="header")
     return _extract_json(raw, expect="object", label="header")
 
+
 def parse_transactions(text: str) -> list:
     chunk = text[:MAX_TXN_CHARS]
-    log.info(f"Transactions: sending {len(chunk):,} / {len(text):,} chars")
+    log.info(f"Transactions: sending {len(chunk):,} / {len(text):,} chars to LLM")
     raw = _infer(TRANSACTION_PROMPT, chunk, label="transactions")
     return _extract_json(raw, expect="array", label="transactions")

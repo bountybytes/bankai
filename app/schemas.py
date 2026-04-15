@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 
 class AccountDetails(BaseModel):
@@ -29,7 +29,7 @@ class Transaction(BaseModel):
     narration:        str = ""
     cheque_no:        str = ""
     reference_no:     str = ""
-    transaction_type: str = ""   # "DEBIT" or "CREDIT"
+    transaction_type: str = ""   # "DEBIT" | "CREDIT"
     debit:            str = ""
     credit:           str = ""
     balance:          str = ""
@@ -51,4 +51,4 @@ class ParseResponse(BaseModel):
     summary:          Summary
     source_file:      str
     used_image_mode:  bool = False
-    timings:          dict = Field(default_factory=dict)
+    timings:          Dict[str, Any] = Field(default_factory=dict)

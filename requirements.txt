@@ -1,20 +1,23 @@
-# API
-fastapi==0.115.5
-uvicorn[standard]==0.32.1
-python-multipart==0.0.12
-pydantic==2.9.2
-python-dotenv==1.0.1
+# ── Web framework ──────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
 
-# PDF Extraction
-PyMuPDF==1.24.14
+# ── PDF extraction ─────────────────────────────────────────────────────────────
+PyMuPDF>=1.24.0
 
-# ML / Inference
-# ⚠️ Install torch FIRST from CUDA wheel index:
-# pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
-transformers>=4.47.0
-accelerate>=1.2.0
-bitsandbytes>=0.45.0
-huggingface_hub>=0.26.0
+# ── GGUF inference (llama-cpp-python with CUDA) ────────────────────────────────
+# Install AFTER setting CMAKE_ARGS for CUDA support:
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --no-cache-dir
+llama-cpp-python>=0.3.4
 
-# Utilities
-regex==2024.9.11
+# ── Data validation ────────────────────────────────────────────────────────────
+pydantic>=2.7.0
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+huggingface_hub>=0.23.0
+
+# ── PyTorch (CUDA 12.4) — for health endpoint VRAM check only ─────────────────
+# Already installed in RunPod base image; no need to reinstall.
+# torch>=2.5.1
