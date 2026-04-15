@@ -26,32 +26,28 @@ def _load_model():
         login(token=hf_token)
         log.info("HuggingFace login OK")
 
-    log.info(f"Downloading / loading: {MODEL_ID}")
-    log.info("This will take ~3–5 min on first run (downloading ~15GB)...")
+    LOCAL_PATH = "/workspace/models/qwen2.5-7b"
+    LOAD_FROM  = LOCAL_PATH if os.path.exists(os.path.join(LOCAL_PATH, "config.json")) else MODEL_ID
+    log.info(f"Loading model from: {LOAD_FROM}")
 
-    _tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_ID,
-        trust_remote_code=True,
-        cache_dir=HF_HOME,
-    )
-
-    # Full FP16 — no quantization on 24GB GPU
+    _tokenizer = AutoTokenizer.from_pretrained(LOAD_FROM, trust_remote_code=True)
     _model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
+        LOAD_FROM,
         dtype=torch.float16,
         device_map={"": 0},
         trust_remote_code=True,
-        cache_dir=HF_HOME,
     )
     _model.eval()
 
     free, total = torch.cuda.mem_get_info(0)
-    log.info(f"Model ready ✓  VRAM: {round((total-free)/1e9,2)} / {round(total/1e9,2)} GB used")
+    log.info(f"Model ready ✓  VRAM: {round((total-free)/1e9,2)} / {round(total/1e9,2)} GB")
 
-MAX_CONTEXT      = int(os.getenv("MAX_CONTEXT",      7168))
-MAX_NEW_TOKENS   = int(os.getenv("MAX_NEW_TOKENS",   3000))
-MAX_HEADER_CHARS = int(os.getenv("MAX_HEADER_CHARS", 2000))
-MAX_TXN_CHARS    = int(os.getenv("MAX_TXN_CHARS",   10000))
+
+# ── No restrictions on RunPod 24GB ────────────────────────────────────────────
+MAX_CONTEXT      = 32768   # Qwen2.5 supports up to 128K — 32K is safe on 24GB
+MAX_NEW_TOKENS   = 81920    # enough for 100+ transactions
+MAX_HEADER_CHARS = 30000
+MAX_TXN_CHARS    = 20000   # send full document
 
 HEADER_PROMPT = """You are a bank statement parser. Extract ONLY account/header details from the text below.
 Return ONLY valid JSON with this exact schema — leave fields as "" if not found. No explanation.
@@ -86,7 +82,7 @@ Rules:
 - date / value_date: YYYY-MM-DD (convert from DD/MM/YYYY or DD-MMM-YYYY)
 - transaction_type: exactly "DEBIT" or "CREDIT"
 - debit and credit are mutually exclusive per row
-- amounts: strip symbols/commas (e.g. "12500.00")
+- amounts: strip symbols/commas — plain number string (e.g. "12500.00")
 - Include EVERY transaction row — do not skip any
 
 TEXT:
@@ -101,10 +97,10 @@ def _infer(prompt: str, text_chunk: str, label: str = "") -> str:
     inputs    = _tokenizer(formatted, return_tensors="pt").to("cuda")
     input_len = inputs["input_ids"].shape[1]
 
-    # Guard against context overflow
-    max_input = MAX_CONTEXT - MAX_NEW_TOKENS - 64
+    # Safety guard — truncate only if truly over limit
+    max_input = MAX_CONTEXT - MAX_NEW_TOKENS - 128
     if input_len > max_input:
-        log.warning(f"[{label}] Truncating {input_len} → {max_input} tokens")
+        log.warning(f"[{label}] Over limit: {input_len} tokens → truncating to {max_input}")
         ratio      = (max_input / input_len) * 0.9
         text_chunk = text_chunk[:int(len(text_chunk) * ratio)]
         messages   = [{"role": "user", "content": prompt + text_chunk}]
@@ -121,8 +117,9 @@ def _infer(prompt: str, text_chunk: str, label: str = "") -> str:
             **inputs,
             max_new_tokens=MAX_NEW_TOKENS,
             do_sample=False,
-            repetition_penalty=1.1,
+            repetition_penalty=1.05,
             pad_token_id=_tokenizer.eos_token_id,
+            eos_token_id=_tokenizer.eos_token_id,
         )
     elapsed    = time.time() - t0
     new_tokens = outputs[0][input_len:]
@@ -135,14 +132,14 @@ def _extract_json(raw: str, expect: str = "object", label: str = "") -> any:
     start = raw.find("[" if expect == "array" else "{")
     end   = raw.rfind("]" if expect == "array" else "}")
     if start == -1 or end <= start:
-        log.error(f"[{label}] No valid JSON {expect} found.\nRaw:\n{raw[:400]}")
+        log.error(f"[{label}] No valid JSON {expect} found.\nRaw (first 500):\n{raw[:500]}")
         return [] if expect == "array" else {}
     try:
         parsed = json.loads(raw[start:end+1])
         log.info(f"[{label}] Parsed OK — {'items: '+str(len(parsed)) if expect=='array' else 'fields: '+str(len(parsed))}")
         return parsed
     except json.JSONDecodeError as e:
-        log.error(f"[{label}] JSON error: {e}\n{raw[start:end+1][:400]}")
+        log.error(f"[{label}] JSON decode error: {e}\nRaw snippet:\n{raw[start:start+400]}")
         return [] if expect == "array" else {}
 
 def parse_header(text: str) -> dict:
@@ -151,6 +148,6 @@ def parse_header(text: str) -> dict:
 
 def parse_transactions(text: str) -> list:
     chunk = text[:MAX_TXN_CHARS]
-    log.info(f"Transactions: {len(chunk):,} / {len(text):,} chars")
+    log.info(f"Transactions: sending {len(chunk):,} / {len(text):,} chars")
     raw = _infer(TRANSACTION_PROMPT, chunk, label="transactions")
     return _extract_json(raw, expect="array", label="transactions")
