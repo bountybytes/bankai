@@ -36,10 +36,10 @@ log = logging.getLogger("bank_ai.main")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("=" * 60)
-    log.info("STARTUP  — Bank Statement AI (GGUF)")
+    log.info("STARTUP  — Bank Statement AI (AWQ)")
     log.info(f"  Model  : {os.getenv('GGUF_MODEL_PATH', 'Qwen3.5-27B Q4_K_M')}")
     log.info(f"  n_ctx  : {os.getenv('N_CTX', '32768')}")
-    log.info("Loading GGUF model into VRAM (~22 GB) — first run takes ~30s ...")
+    log.info("Loading GGUF model into VRAM (~22 GB)/Loading AWQ model into VRAM (~20 GB)")
     load_model()
     log.info("Model ready ✓  Server is now accepting requests.")
     log.info("=" * 60)
