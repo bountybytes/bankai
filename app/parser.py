@@ -1,86 +1,47 @@
 """
-parser.py — HuggingFace Transformers + AutoAWQ inference
-Model  : QuantTrio/Qwen3.5-27B-AWQ  (text-only, standard Qwen3 arch, AWQ INT4)
+parser.py — llama-cpp-python inference (GGUF)
+Model  : Qwen3.5-27B.Q4_K_M.gguf
 VRAM   : ~17-19 GB on RTX 4090
-Backend: transformers + autoawq (no llama-cpp needed)
+Backend: llama-cpp-python with CUDA offload (no transformers/AWQ needed)
 """
 
-import os, re, json, logging, time, torch
+import os, re, json, logging, time
 from dotenv import load_dotenv
 
 load_dotenv()
 log = logging.getLogger("bank_ai.parser")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-MODEL_ID   = os.getenv("MODEL_ID",   "QuantTrio/Qwen3.5-27B-AWQ")
-LOCAL_PATH = os.getenv("MODEL_PATH", "/workspace/models/Qwen3.5-27B-AWQ")
-HF_TOKEN   = os.getenv("HF_TOKEN")
-HF_HOME    = os.getenv("HF_HOME", "/workspace/models")
-
-os.environ["HF_HOME"]            = HF_HOME
-os.environ["TRANSFORMERS_CACHE"] = HF_HOME
-os.environ["HF_HUB_CACHE"]       = HF_HOME
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-MAX_NEW_TOKENS   = int(os.getenv("MAX_NEW_TOKENS",   "8192"))
+MODEL_PATH     = os.getenv("MODEL_PATH",     "/workspace/models/Qwen3.5-27B.Q4_K_M.gguf")
+N_GPU_LAYERS   = int(os.getenv("N_GPU_LAYERS",   "-1"))   # -1 = all layers on GPU
+N_CTX          = int(os.getenv("N_CTX",          "32768"))
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS",  "8192"))
 MAX_HEADER_CHARS = int(os.getenv("MAX_HEADER_CHARS", "4000"))
 MAX_TXN_CHARS    = int(os.getenv("MAX_TXN_CHARS",    "30000"))
-MAX_CONTEXT      = int(os.getenv("MAX_CONTEXT",      "32768"))
 
-_tokenizer = None
-_model     = None
+_llm = None
 
 
 # ── Model loader ───────────────────────────────────────────────────────────────
 def _load_model():
-    global _tokenizer, _model
-    if _model is not None:
+    global _llm
+    if _llm is not None:
         return
 
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    from huggingface_hub import login
+    from llama_cpp import Llama
 
-    if HF_TOKEN:
-        login(token=HF_TOKEN)
-        log.info("HuggingFace login OK")
+    log.info(f"Loading GGUF model: {MODEL_PATH}")
+    log.info(f"  n_ctx={N_CTX}  n_gpu_layers={N_GPU_LAYERS}  temp=0.0")
 
-    load_from = LOCAL_PATH if os.path.exists(
-        os.path.join(LOCAL_PATH, "config.json")
-    ) else MODEL_ID
-
-    log.info(f"Loading model from: {load_from}")
-
-    # Verify architecture before loading to catch wrong model early
-    import json as _json
-    cfg_path = os.path.join(load_from, "config.json")
-    if os.path.exists(cfg_path):
-        cfg = _json.load(open(cfg_path))
-        model_type = cfg.get("model_type", "")
-        has_vision = "vision" in str(cfg).lower() or "visual" in str(cfg).lower()
-        if has_vision:
-            raise RuntimeError(
-                f"WRONG MODEL: {load_from} is a vision-language model ({model_type}). "
-                "Use QuantTrio/Qwen3.5-27B-AWQ (text-only)."
-            )
-        log.info(f"Architecture check OK — model_type: {model_type}")
-
-    _tokenizer = AutoTokenizer.from_pretrained(
-        load_from,
-        trust_remote_code=True
+    _llm = Llama(
+        model_path    = MODEL_PATH,
+        n_ctx         = N_CTX,
+        n_gpu_layers  = N_GPU_LAYERS,
+        n_threads     = 8,
+        flash_attn    = False,       # disable — safer on first run
+        verbose       = False,
     )
-
-    _model = AutoModelForCausalLM.from_pretrained(
-        load_from,
-        dtype=torch.float16,
-        device_map={"": 0},        # all layers → GPU 0
-        trust_remote_code=True,
-    )
-    _model.eval()
-
-    free, total = torch.cuda.mem_get_info(0)
-    used = round((total - free) / 1e9, 2)
-    tot  = round(total / 1e9, 2)
-    log.info(f"Model ready ✓  VRAM used: {used} / {tot} GB")
+    log.info("GGUF model ready ✓")
 
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
@@ -138,66 +99,37 @@ def _strip_thinking(text: str) -> str:
 def _infer(prompt: str, text: str, label: str = "") -> str:
     _load_model()
 
-    messages = [{"role": "user", "content": prompt + text}]
+    full_prompt = prompt + text
 
-    # enable_thinking=False — suppress reasoning block, output pure JSON
-    try:
-        formatted = _tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-    except TypeError:
-        formatted = _tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+    # Approximate token count (4 chars ≈ 1 token)
+    approx_tokens = len(full_prompt) // 4
+    max_input     = N_CTX - MAX_NEW_TOKENS - 128
 
-    inputs    = _tokenizer(formatted, return_tensors="pt").to("cuda")
-    input_len = inputs["input_ids"].shape[1]
-
-    # Safety: truncate if over context window
-    max_ctx = MAX_CONTEXT - MAX_NEW_TOKENS - 128
-    if input_len > max_ctx:
-        ratio = (max_ctx / input_len) * 0.9
+    if approx_tokens > max_input:
+        ratio = (max_input / approx_tokens) * 0.9
         text  = text[:int(len(text) * ratio)]
-        log.warning(f"[{label}] Over limit ({input_len} tokens) — truncating to fit context")
-        messages = [{"role": "user", "content": prompt + text}]
-        try:
-            formatted = _tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-            )
-        except TypeError:
-            formatted = _tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        inputs    = _tokenizer(formatted, return_tensors="pt").to("cuda")
-        input_len = inputs["input_ids"].shape[1]
+        log.warning(f"[{label}] Estimated over limit — truncating text to {len(text):,} chars")
+        full_prompt = prompt + text
 
-    log.info(f"[{label}] Input: {input_len} tokens | Max new: {MAX_NEW_TOKENS}")
-    torch.cuda.empty_cache()
+    log.info(f"[{label}] Sending ~{len(full_prompt)//4} tokens | Max new: {MAX_NEW_TOKENS}")
 
     t0 = time.time()
-    with torch.no_grad():
-        outputs = _model.generate(
-            **inputs,
-            max_new_tokens     = MAX_NEW_TOKENS,
-            do_sample          = False,
-            repetition_penalty = 1.05,
-            pad_token_id       = _tokenizer.eos_token_id,
-            eos_token_id       = _tokenizer.eos_token_id,
-        )
+    response = _llm.create_chat_completion(
+        messages=[{"role": "user", "content": full_prompt}],
+        max_tokens    = MAX_NEW_TOKENS,
+        temperature   = 0.0,
+        repeat_penalty= 1.05,
+    )
+    elapsed = time.time() - t0
 
-    elapsed    = time.time() - t0
-    new_tokens = outputs[0][input_len:]
-    raw_result = _tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-    result     = _strip_thinking(raw_result)
+    raw = response["choices"][0]["message"]["content"].strip()
 
-    tps = len(new_tokens) / max(elapsed, 0.1)
-    log.info(f"[{label}] {len(new_tokens)} tokens in {elapsed:.2f}s ({tps:.0f} t/s)")
-    return result
+    # Usage stats
+    usage = response.get("usage", {})
+    out_tokens = usage.get("completion_tokens", "?")
+    log.info(f"[{label}] {out_tokens} tokens in {elapsed:.2f}s ({int(out_tokens)/max(elapsed,0.1):.0f} t/s)")
+
+    return _strip_thinking(raw)
 
 
 # ── JSON extraction ────────────────────────────────────────────────────────────
@@ -226,7 +158,7 @@ def _extract_json(raw: str, expect: str = "object", label: str = "") -> any:
 
 # ── Public interface ───────────────────────────────────────────────────────────
 def load_model():
-    """Pre-load model into VRAM at startup (called from main.py lifespan)."""
+    """Pre-load GGUF model into VRAM at startup (called from main.py lifespan)."""
     _load_model()
 
 
