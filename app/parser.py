@@ -48,15 +48,13 @@ def _load_glm():
     global _glm_model, _glm_processor
     if _glm_model is not None:
         return
-    import torch
-    from transformers import AutoProcessor, AutoModelForCausalLM
+    from transformers import AutoProcessor, AutoModelForImageTextToText
     log.info(f"Loading GLM-OCR: {GLM_OCR_PATH}")
-    _glm_processor = AutoProcessor.from_pretrained(GLM_OCR_PATH, trust_remote_code=True)
-    _glm_model = AutoModelForCausalLM.from_pretrained(
+    _glm_processor = AutoProcessor.from_pretrained(GLM_OCR_PATH)
+    _glm_model = AutoModelForImageTextToText.from_pretrained(
         GLM_OCR_PATH,
-        torch_dtype       = torch.float16,
-        device_map        = GLM_DEVICE,
-        trust_remote_code = True,
+        dtype="auto",          # ← not torch_dtype
+        device_map="auto",     # ← not GLM_DEVICE string
     )
     _glm_model.eval()
     log.info("GLM-OCR ready ✓")
@@ -160,30 +158,79 @@ def _glm_extract_page(pdf_path: str, page_num: int) -> list:
     import torch
     _load_glm()
 
-    img    = _render_page(pdf_path, page_num)
-    inputs = _glm_processor(
-        text   = GLM_TXN_PROMPT,
-        images = img,
-        return_tensors = "pt",
-    ).to(GLM_DEVICE)
+    img = _render_page(pdf_path, page_num)
 
-    t0 = time.time()
-    with torch.no_grad():
-        out_ids = _glm_model.generate(
-            **inputs,
-            max_new_tokens = GLM_MAX_NEW,  # bounded per page — array always closes
-            do_sample      = False,
-            temperature    = 1.0,
-        )
-    elapsed   = time.time() - t0
-    input_len = inputs["input_ids"].shape[1]
-    raw = _glm_processor.decode(
-        out_ids[0][input_len:], skip_special_tokens=True
-    ).strip()
+    # Save PIL image to temp file — GLM-OCR needs a file path in the message
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img:
+        img.save(tmp_img.name)
+        tmp_img_path = tmp_img.name
 
-    out_tokens = out_ids.shape[1] - input_len
-    log.info(f"[glm-page-{page_num+1}] {out_tokens} tokens in {elapsed:.1f}s")
-    return _extract_json_array(raw, f"glm-page-{page_num+1}")
+    # GLM-OCR Information Extraction prompt — JSON schema format
+    # This is the ONLY supported extraction format per official docs
+    prompt_text = """请按下列JSON格式输出图中所有交易记录:
+[
+  {
+    "date": "",
+    "value_date": "",
+    "description": "",
+    "narration": "",
+    "cheque_no": "",
+    "reference_no": "",
+    "transaction_type": "",
+    "debit": "",
+    "credit": "",
+    "balance": "",
+    "branch_code": "",
+    "remarks": ""
+  }
+]
+
+Rules:
+- date/value_date: YYYY-MM-DD format
+- transaction_type: DEBIT or CREDIT only
+- amounts: strip commas and rupee symbol, plain number like 1250.00
+- Skip header rows
+- If no transactions visible output: []"""
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "url": tmp_img_path},
+                {"type": "text",  "text": prompt_text},
+            ],
+        }
+    ]
+
+    try:
+        inputs = _glm_processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(_glm_model.device)
+        inputs.pop("token_type_ids", None)  # GLM-OCR doesn't use this
+
+        t0 = time.time()
+        with torch.no_grad():
+            out_ids = _glm_model.generate(
+                **inputs,
+                max_new_tokens=GLM_MAX_NEW,
+                do_sample=False,
+            )
+        elapsed   = time.time() - t0
+        input_len = inputs["input_ids"].shape[1]
+        raw = _glm_processor.decode(
+            out_ids[0][input_len:], skip_special_tokens=False
+        ).strip()
+
+        out_tokens = out_ids.shape[1] - input_len
+        log.info(f"[glm-page-{page_num+1}] {out_tokens} tokens in {elapsed:.1f}s")
+        return _extract_json_array(raw, f"glm-page-{page_num+1}")
+    finally:
+        os.unlink(tmp_img_path)  # cleanup temp image
 
 # ── Public: parse_transactions ─────────────────────────────────────────────────
 def parse_transactions(text: str, pdf_path: str = None) -> list:
