@@ -39,10 +39,11 @@ class Transaction(BaseModel):
 
 
 class Summary(BaseModel):
-    total_transactions: int   = 0
-    total_debit:        float = 0.0
-    total_credit:       float = 0.0
-    net_flow:           float = 0.0
+    total_transactions: int = 0
+    total_debit: float = 0.0
+    total_credit: float = 0.0
+    net_flow: float = 0.0
+    categories: Dict[str, int] = Field(default_factory=dict)  # ← new field
 
 
 class ParseResponse(BaseModel):
