@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.extractor   import extract_text, anonymize_sensitive, restore_sensitive
+from app.extractor import extract_text, extract_header_text, anonymize_sensitive, restore_sensitive
 from app.parser      import parse_header, parse_transactions, load_model
 from app.categorizer import categorize_transactions
 from app.schemas     import ParseResponse
@@ -69,28 +69,35 @@ def _run_pipeline(pdf_bytes: bytes, filename: str) -> dict:
     req_id = uuid.uuid4().hex[:8]
     t0 = time.time()
 
-    # ── Save PDF — keep alive for GLM-OCR page rendering ──
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.write(pdf_bytes)
     tmp.flush()
     tmp_path = tmp.name
-    tmp.close()                          # close handle but DON'T delete yet
+    tmp.close()
 
-    raw_text = extract_text(tmp_path)
+    # Extract text two ways:
+    raw_text        = extract_text(tmp_path)        # pipe-delimited tables (for txn fallback)
+    header_raw_text = extract_header_text(tmp_path) # plain text page 1-2 (for account header)
     t1 = time.time()
+    log.info(f"[{req_id}] Extracted {len(raw_text):,} chars / header {len(header_raw_text):,} chars")
 
-    anon_text, restore_map = anonymize_sensitive(raw_text)
+    # Anonymise both
+    anon_text,        restore_map  = anonymize_sensitive(raw_text)
+    anon_header_text, restore_map2 = anonymize_sensitive(header_raw_text)
+    restore_map.update(restore_map2)
 
-    # Header — Qwen (text only, ~512 tokens out)
-    acc_details = parse_header(anon_text)
+    # Stage 4a — Qwen: account header from plain page-1 text
+    log.info(f"[{req_id}] Parsing header with Qwen ...")
+    acc_details = parse_header(anon_header_text)         # ← uses plain text now
     acc_details = restore_sensitive(acc_details, restore_map)
 
-    # Transactions — GLM-OCR (pass pdf_path so it can render pages)
+    # Stage 4b — GLM-OCR: transactions from page images
+    log.info(f"[{req_id}] Parsing transactions with GLM-OCR ...")
     transactions = parse_transactions(anon_text, pdf_path=tmp_path)
     transactions = [restore_sensitive(t, restore_map) for t in transactions]
     t2 = time.time()
 
-    os.unlink(tmp_path)                  # ← delete AFTER inference completes
+    os.unlink(tmp_path)                 # ← delete AFTER inference completes
 
     # Categorise
     transactions = categorize_transactions(transactions)
