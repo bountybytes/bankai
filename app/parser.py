@@ -1,10 +1,10 @@
 """
 parser.py — Hybrid AI parser
   Account header  → Qwen2.5-Coder-14B GGUF  (plain text → JSON)
-  Transactions    → GLM-OCR (page image → OCR text) + Qwen (OCR text → JSON)
+  Transactions    → GLM-OCR (page images → OCR text) + Qwen (OCR text → JSON)
 """
 
-import os, re, json, logging, time
+import os, re, json, logging, time, tempfile
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -17,8 +17,8 @@ GLM_OCR_PATH     = os.getenv("GLM_OCR_PATH",     "/workspace/models/GLM-OCR")
 N_GPU_LAYERS     = int(os.getenv("N_GPU_LAYERS",      "-1"))
 N_CTX            = int(os.getenv("N_CTX",             "8192"))
 MAX_HEADER_CHARS = int(os.getenv("MAX_HEADER_CHARS",  "8000"))
-GLM_MAX_NEW      = int(os.getenv("GLM_MAX_NEW_TOKENS", "4096"))
-PAGE_DPI         = int(os.getenv("PAGE_DPI",          "200"))  # higher DPI for GLM
+GLM_MAX_NEW      = int(os.getenv("GLM_MAX_NEW_TOKENS", "8192"))
+PAGE_DPI         = int(os.getenv("PAGE_DPI",          "200"))
 
 _qwen          = None
 _glm_model     = None
@@ -46,22 +46,14 @@ def _load_glm():
     if _glm_model is not None:
         return
     import torch
-    from transformers import AutoProcessor, AutoModel
-
+    # ✅ Correct class: GlmOcrForConditionalGeneration (native in transformers, no trust_remote_code needed)
+    from transformers import AutoProcessor, GlmOcrForConditionalGeneration
     log.info(f"Loading GLM-OCR: {GLM_OCR_PATH}")
-
-    _glm_processor = AutoProcessor.from_pretrained(
+    _glm_processor = AutoProcessor.from_pretrained(GLM_OCR_PATH)
+    _glm_model = GlmOcrForConditionalGeneration.from_pretrained(
         GLM_OCR_PATH,
-        trust_remote_code=True,
-    )
-
-    # GLM-OCR uses AutoModel, not AutoModelForCausalLM
-    # It has a custom GlmOcrConfig that only registers under AutoModel
-    _glm_model = AutoModel.from_pretrained(
-        GLM_OCR_PATH,
-        dtype         = torch.float16,
-        device_map    = "auto",
-        trust_remote_code = True,
+        dtype      = torch.bfloat16,
+        device_map = "auto",
     )
     _glm_model.eval()
     log.info("GLM-OCR ready ✓")
@@ -99,23 +91,24 @@ Schema (use "" for missing):
 
 Rules:
 - statement_from/to : YYYY-MM-DD
-- balances : plain number, no commas, no ₹  e.g. "21675.91"
-- currency : "INR"
-- bank_type : "Public" / "Private" / "Co-operative"
+- balances          : plain number, no commas, no ₹  e.g. "21675.91"
+- currency          : "INR"
+- bank_type         : "Public" / "Private" / "Co-operative"
 
 TEXT:
 """
 
-# Qwen prompt to convert GLM-OCR raw OCR text → JSON transactions
 TXN_FROM_OCR_PROMPT = """\
 You are a precise JSON extractor for Indian bank transactions.
-Below is raw OCR text extracted from one page of a bank statement.
+Below is raw OCR text from one page of a bank statement.
 Extract EVERY transaction row. Output ONLY a valid JSON array. No explanation, no markdown.
 
-CRITICAL: Each transaction has EITHER debit OR credit — NEVER both filled.
-- "WDL TFR", "UPI/DR" = DEBIT (money out)
-- "DEP TFR", "UPI/CR", "UPI/REV" = CREDIT (money in)
-- Third amount column is always "balance" — do NOT put it in credit or debit
+CRITICAL — debit/credit rules:
+- Each transaction has EITHER debit OR credit — NEVER both filled
+- "WDL TFR", "UPI/DR" → DEBIT (money out)
+- "DEP TFR", "UPI/CR", "UPI/REV" → CREDIT (money in)
+- The third amount column is always "balance" — do NOT copy it into credit or debit
+- transaction_type must be "DEBIT" when debit has value, "CREDIT" when credit has value
 
 Schema per object:
 {"date":"","value_date":"","description":"","narration":"","cheque_no":"",
@@ -123,18 +116,18 @@ Schema per object:
  "branch_code":"","remarks":""}
 
 Rules:
-- date/value_date : YYYY-MM-DD
-- amounts : strip commas and ₹, plain number e.g. "1250.00"
-- description : single line, no newlines
+- date/value_date : YYYY-MM-DD (convert DD/MM/YYYY or DD-MM-YYYY)
+- amounts         : strip commas and ₹, plain number e.g. "1250.00"
+- description     : single line, no newlines
 - Skip rows that are only column headers (Date, Narration, Debit, Credit, Balance)
-- If no transactions visible, output: []
+- If no transactions visible output: []
 
 OCR TEXT:
 """
 
-# ── GLM-OCR: page image → raw OCR text ────────────────────────────────────────
+# ── GLM-OCR: page image → OCR text ────────────────────────────────────────────
 def _render_page(pdf_path: str, page_num: int):
-    """Render a PDF page to a PIL Image at PAGE_DPI."""
+    """Render a PDF page to a PIL Image."""
     import fitz
     from PIL import Image
     doc  = fitz.open(pdf_path)
@@ -145,79 +138,96 @@ def _render_page(pdf_path: str, page_num: int):
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 def _glm_ocr_page(pdf_path: str, page_num: int) -> str:
+    """
+    Run GLM-OCR on one PDF page image → returns raw OCR text.
+    Uses the official GlmOcrForConditionalGeneration API pattern.
+    """
     import torch
     _load_glm()
 
     img = _render_page(pdf_path, page_num)
 
-    inputs = _glm_processor(
-        text   = "Transcribe ALL text in this image exactly as it appears, preserving table structure with spaces.",
-        images = img,
-        return_tensors = "pt",
-    ).to(_glm_model.device)
+    # Save page image to temp file — GLM-OCR expects a file URL in the message
+    tmp_img = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    img.save(tmp_img.name)
+    tmp_img.close()
 
-    # Some processors don't set pad_token_id — use eos as fallback
-    pad_id = getattr(_glm_processor.tokenizer, "pad_token_id", None) \
-          or getattr(_glm_processor.tokenizer, "eos_token_id", 0)
+    # ✅ Official GLM-OCR message format from HuggingFace docs
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "url": tmp_img.name},
+                {"type": "text",  "text": "Text Recognition:"},
+            ],
+        }
+    ]
 
-    t0 = time.time()
-    with torch.no_grad():
-        out_ids = _glm_model.generate(
-            **inputs,
-            max_new_tokens = GLM_MAX_NEW,
-            do_sample      = False,
-            pad_token_id   = pad_id,
-        )
-    elapsed = time.time() - t0
+    try:
+        # ✅ Official pattern: apply_chat_template → generate → decode
+        inputs = _glm_processor.apply_chat_template(
+            messages,
+            tokenize              = True,
+            add_generation_prompt = True,
+            return_dict           = True,
+            return_tensors        = "pt",
+        ).to(_glm_model.device)
+        inputs.pop("token_type_ids", None)  # ✅ must remove — causes errors if present
 
-    input_len = inputs["input_ids"].shape[1]
-    ocr_text  = _glm_processor.decode(
-        out_ids[0][input_len:],
-        skip_special_tokens = True,
-    ).strip()
+        t0 = time.time()
+        with torch.no_grad():
+            generated_ids = _glm_model.generate(
+                **inputs,
+                max_new_tokens = GLM_MAX_NEW,
+            )
+        elapsed = time.time() - t0
 
-    out_tokens = out_ids.shape[1] - input_len
-    log.info(f"[glm-page-{page_num+1}] OCR: {out_tokens} tokens in {elapsed:.1f}s  ({len(ocr_text)} chars)")
-    log.debug(f"[glm-page-{page_num+1}] OCR preview:\n{ocr_text[:400]}")
-    return ocr_text
+        input_len  = inputs["input_ids"].shape[1]
+        # ✅ skip_special_tokens=False per official GLM-OCR example
+        ocr_text = _glm_processor.decode(
+            generated_ids[0][input_len:],
+            skip_special_tokens = False,
+        ).strip()
 
+        out_tokens = generated_ids.shape[1] - input_len
+        log.info(f"[glm-page-{page_num+1}] OCR: {out_tokens} tokens in {elapsed:.1f}s  ({len(ocr_text)} chars)")
+        log.debug(f"[glm-page-{page_num+1}] OCR preview:\n{ocr_text[:500]}")
+        return ocr_text
+
+    finally:
+        os.unlink(tmp_img.name)
+
+# ── Qwen: OCR text → structured JSON ──────────────────────────────────────────
 def _qwen_parse_ocr(ocr_text: str, page_label: str) -> list:
-    """
-    Pass GLM-OCR output text to Qwen2.5-Coder for JSON structuring.
-    Qwen is excellent at this — it's a code model trained on structured extraction.
-    """
+    """Convert GLM-OCR output text → structured JSON transactions via Qwen."""
     _load_qwen()
-    if not ocr_text.strip():
-        log.warning(f"[{page_label}] Empty OCR text — skipping Qwen")
+
+    # Strip any remaining GLM special tokens before sending to Qwen
+    clean = re.sub(r"<\|[^|]*\|>", "", ocr_text).strip()
+    if not clean:
+        log.warning(f"[{page_label}] Empty OCR after cleaning — skipping")
         return []
 
-    prompt = TXN_FROM_OCR_PROMPT + ocr_text
-    t0 = time.time()
+    t0   = time.time()
     resp = _qwen.create_chat_completion(
-        messages       = [{"role": "user", "content": prompt}],
+        messages       = [{"role": "user", "content": TXN_FROM_OCR_PROMPT + clean}],
         max_tokens     = 4096,
         temperature    = 0.0,
         repeat_penalty = 1.05,
     )
     raw    = resp["choices"][0]["message"]["content"].strip()
     finish = resp["choices"][0].get("finish_reason", "?")
-    elapsed = time.time() - t0
-    log.info(f"[{page_label}] Qwen parse: {elapsed:.1f}s  finish={finish}")
+    log.info(f"[{page_label}] Qwen parse: {time.time()-t0:.1f}s  finish={finish}")
     if finish == "length":
-        log.warning(f"[{page_label}] ⚠️ Qwen output cut off — reduce page token count")
+        log.warning(f"[{page_label}] ⚠️ Qwen output cut off")
 
     return _extract_json_array(raw, page_label)
 
-# ── Public: parse_transactions ─────────────────────────────────────────────────
+# ── Public API ─────────────────────────────────────────────────────────────────
 def parse_transactions(text: str, pdf_path: str = None) -> list:
-    """
-    GLM-OCR extracts raw text from each page image.
-    Qwen2.5-Coder converts that raw OCR text to structured JSON.
-    Two-stage pipeline: GLM-OCR (vision) → Qwen (structuring).
-    """
     if pdf_path:
         return _parse_with_glm_plus_qwen(pdf_path)
-    log.warning("pdf_path not provided — falling back to Qwen text-only mode")
+    log.warning("pdf_path not provided — Qwen text-only fallback")
     return _parse_with_qwen_text(text)
 
 def _parse_with_glm_plus_qwen(pdf_path: str) -> list:
@@ -227,55 +237,25 @@ def _parse_with_glm_plus_qwen(pdf_path: str) -> list:
     doc.close()
     log.info(f"[pipeline] GLM-OCR + Qwen — {n_pages} pages")
 
-    all_txns: list = []
+    all_txns = []
     for page_num in range(n_pages):
-        page_label = f"page-{page_num+1}/{n_pages}"
-
-        # Stage 1: GLM-OCR — image → text
-        ocr_text = _glm_ocr_page(pdf_path, page_num)
-
-        # Stage 2: Qwen — text → JSON
-        rows = _qwen_parse_ocr(ocr_text, page_label)
-        rows = _post_process(rows)
-
+        label    = f"page-{page_num+1}/{n_pages}"
+        ocr_text = _glm_ocr_page(pdf_path, page_num)       # Vision → text
+        rows     = _qwen_parse_ocr(ocr_text, label)        # Text → JSON
+        rows     = _post_process(rows)
         before   = len(all_txns)
         all_txns = _dedupe(all_txns + rows)
-        log.info(f"[{page_label}] +{len(all_txns)-before} new rows  total={len(all_txns)}")
+        log.info(f"[{label}] +{len(all_txns)-before} new rows  total={len(all_txns)}")
 
     log.info(f"[pipeline] DONE — {len(all_txns)} transactions")
     return all_txns
 
-# ── Qwen text-only fallback (no pdf_path) ─────────────────────────────────────
-_CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE",    "6000"))
-_CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
-
-def _parse_with_qwen_text(text: str) -> list:
-    _load_qwen()
-    chunks   = _chunk_text(text, _CHUNK_SIZE, _CHUNK_OVERLAP)
-    all_txns = []
-    for i, chunk in enumerate(chunks):
-        label = f"qwen-chunk-{i+1}/{len(chunks)}"
-        resp  = _qwen.create_chat_completion(
-            messages       = [{"role": "user", "content": TXN_FROM_OCR_PROMPT + chunk}],
-            max_tokens     = 4096,
-            temperature    = 0.0,
-            repeat_penalty = 1.05,
-        )
-        raw    = resp["choices"][0]["message"]["content"].strip()
-        finish = resp["choices"][0].get("finish_reason", "?")
-        if finish == "length":
-            log.warning(f"[{label}] ⚠️ output cut off")
-        txns     = _extract_json_array(raw, label)
-        all_txns = _dedupe(all_txns + _post_process(txns))
-    return all_txns
-
-# ── Qwen: account header ───────────────────────────────────────────────────────
+# ── Qwen header ────────────────────────────────────────────────────────────────
 def parse_header(header_text: str) -> dict:
     _load_qwen()
-    prompt = HEADER_PROMPT + header_text[:MAX_HEADER_CHARS]
-    t0     = time.time()
-    resp   = _qwen.create_chat_completion(
-        messages       = [{"role": "user", "content": prompt}],
+    t0   = time.time()
+    resp = _qwen.create_chat_completion(
+        messages       = [{"role": "user", "content": HEADER_PROMPT + header_text[:MAX_HEADER_CHARS]}],
         max_tokens     = 1024,
         temperature    = 0.0,
         repeat_penalty = 1.05,
@@ -293,6 +273,28 @@ def parse_header(header_text: str) -> dict:
             result[f] = _normalize_date(result[f])
     return result
 
+# ── Qwen text-only fallback ────────────────────────────────────────────────────
+_CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE",    "6000"))
+_CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
+
+def _parse_with_qwen_text(text: str) -> list:
+    _load_qwen()
+    chunks, all_txns = _chunk_text(text, _CHUNK_SIZE, _CHUNK_OVERLAP), []
+    for i, chunk in enumerate(chunks):
+        label = f"qwen-chunk-{i+1}/{len(chunks)}"
+        resp  = _qwen.create_chat_completion(
+            messages       = [{"role": "user", "content": TXN_FROM_OCR_PROMPT + chunk}],
+            max_tokens     = 4096,
+            temperature    = 0.0,
+            repeat_penalty = 1.05,
+        )
+        raw    = resp["choices"][0]["message"]["content"].strip()
+        finish = resp["choices"][0].get("finish_reason", "?")
+        if finish == "length":
+            log.warning(f"[{label}] ⚠️ output cut off")
+        all_txns = _dedupe(all_txns + _post_process(_extract_json_array(raw, label)))
+    return all_txns
+
 # ── Post-processing ────────────────────────────────────────────────────────────
 def _post_process(rows: list) -> list:
     out = []
@@ -303,22 +305,17 @@ def _post_process(rows: list) -> list:
             if row.get(f):
                 row[f] = " ".join(str(row[f]).split())
         for f in ("debit", "credit", "balance"):
-            raw_val = str(row.get(f) or "").replace(",", "").replace("₹", "").replace("-", "").strip()
-            row[f]  = raw_val if _valid_amount(raw_val) else ""
+            v = str(row.get(f) or "").replace(",","").replace("₹","").replace("-","").strip()
+            row[f] = v if _valid_amount(v) else ""
 
-        debit    = row.get("debit",  "").strip()
-        credit   = row.get("credit", "").strip()
-        txn_type = row.get("transaction_type", "").upper()
-        desc     = row.get("description", "").upper()
+        debit, credit = row.get("debit","").strip(), row.get("credit","").strip()
+        txn_type      = row.get("transaction_type","").upper()
+        desc          = row.get("description","").upper()
 
         if debit and credit:
             is_cr = txn_type == "CREDIT" or desc.startswith("DEP") or "UPI/CR" in desc or "UPI/REV" in desc
-            if is_cr:
-                row["debit"]            = ""
-                row["transaction_type"] = "CREDIT"
-            else:
-                row["credit"]           = ""
-                row["transaction_type"] = "DEBIT"
+            row["debit"], row["credit"]      = ("", debit) if is_cr else (debit, "")
+            row["transaction_type"]          = "CREDIT" if is_cr else "DEBIT"
         elif debit:
             row["transaction_type"] = "DEBIT"
         elif credit:
@@ -333,20 +330,18 @@ def _post_process(rows: list) -> list:
         out.append(row)
     return out
 
-def _valid_amount(val: str) -> bool:
+def _valid_amount(v: str) -> bool:
     try:
-        return float(val) > 0
+        return float(v) > 0
     except (ValueError, TypeError):
         return False
 
 def _normalize_date(s: str) -> str:
     s = s.strip()
-    if not s:
-        return ""
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+    if not s or re.match(r"^\d{4}-\d{2}-\d{2}$", s):
         return s
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y",
-                "%d %b %Y", "%d-%b-%Y", "%d/%b/%Y", "%d %B %Y"):
+    for fmt in ("%d/%m/%Y","%d-%m-%Y","%d/%m/%y","%d-%m-%y",
+                "%d %b %Y","%d-%b-%Y","%d/%b/%Y","%d %B %Y"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except ValueError:
@@ -356,44 +351,40 @@ def _normalize_date(s: str) -> str:
 
 # ── JSON helpers ───────────────────────────────────────────────────────────────
 def _strip_fences(raw: str) -> str:
-    raw = re.sub(r"```json\s*", "", raw)
-    raw = re.sub(r"```\s*",     "", raw)
-    return raw.strip()
+    return re.sub(r"```(?:json)?\s*", "", raw).strip()
 
 def _extract_json_object(raw: str, label: str) -> dict:
-    raw   = _strip_fences(raw)
-    start = raw.find("{");  end = raw.rfind("}")
-    if start == -1 or end <= start:
-        log.error(f"[{label}] No JSON object found\n{raw[:400]}")
+    raw = _strip_fences(raw)
+    s, e = raw.find("{"), raw.rfind("}")
+    if s == -1 or e <= s:
+        log.error(f"[{label}] No JSON object\n{raw[:400]}")
         return {}
     try:
-        return json.loads(raw[start:end + 1])
-    except json.JSONDecodeError as e:
-        log.error(f"[{label}] JSON error: {e}")
+        return json.loads(raw[s:e+1])
+    except json.JSONDecodeError as err:
+        log.error(f"[{label}] JSON error: {err}")
         return {}
 
 def _extract_json_array(raw: str, label: str) -> list:
-    raw   = _strip_fences(raw)
-    start = raw.find("[");  end = raw.rfind("]")
-    if start == -1 or end <= start:
-        log.warning(f"[{label}] No JSON array found — 0 rows")
-        log.debug(f"[{label}] raw snippet: {raw[:400]}")
+    raw = _strip_fences(raw)
+    s, e = raw.find("["), raw.rfind("]")
+    if s == -1 or e <= s:
+        log.warning(f"[{label}] No JSON array — 0 rows\nRaw: {raw[:300]}")
         return []
     try:
-        result = json.loads(raw[start:end + 1])
+        result = json.loads(raw[s:e+1])
         return result if isinstance(result, list) else []
-    except json.JSONDecodeError as e:
-        log.error(f"[{label}] JSON decode error: {e}\n{raw[start:start+400]}")
+    except json.JSONDecodeError as err:
+        log.error(f"[{label}] JSON decode error: {err}\n{raw[s:s+400]}")
         return []
 
-def _dedupe(transactions: list) -> list:
+def _dedupe(txns: list) -> list:
     seen, out = set(), []
-    for txn in transactions:
-        key = (txn.get("date",""), txn.get("description","")[:50],
-               txn.get("debit",""), txn.get("credit",""), txn.get("balance",""))
-        if key not in seen:
-            seen.add(key)
-            out.append(txn)
+    for t in txns:
+        k = (t.get("date",""), t.get("description","")[:50], t.get("debit",""), t.get("credit",""), t.get("balance",""))
+        if k not in seen:
+            seen.add(k)
+            out.append(t)
     return out
 
 def _chunk_text(text: str, size: int, overlap: int) -> list:
