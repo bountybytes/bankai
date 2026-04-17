@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 log = logging.getLogger("bank_ai.parser")
 
-MODEL_PATH       = os.getenv("MODEL_PATH", "/workspace/models/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf")
+MODEL_PATH       = os.getenv("MODEL_PATH", "/workspace/models/qwen2.5-coder-14b-instruct-q4_k_m.gguf")
 N_GPU_LAYERS     = int(os.getenv("N_GPU_LAYERS", "-1"))
 N_CTX            = int(os.getenv("N_CTX", "32768"))
 MAX_NEW_TOKENS   = int(os.getenv("MAX_NEW_TOKENS", "4096"))
