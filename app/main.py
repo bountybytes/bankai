@@ -224,7 +224,7 @@ async def parse_sync(file: UploadFile = File(...)):
 @app.get("/health", tags=["System"], summary="Health Check")
 def health():
     import torch
-    from app.parser import _llm
+    from app.parser import _qwen, _glm_model          # ← fix: was _llm
 
     cuda_ok = torch.cuda.is_available()
     vram_free = vram_total = vram_used = 0.0
@@ -235,19 +235,19 @@ def health():
         vram_used  = round((total_b - free_b) / 1e9, 2)
 
     jobs_summary = Counter(j["status"] for j in _jobs.values())
-    log.info(f"[health] VRAM {vram_used}/{vram_total} GB  loaded={_llm is not None}")
 
     return {
-        "status":        "ok",
-        "model_loaded":  _llm is not None,
-        "cuda":          cuda_ok,
-        "gpu":           torch.cuda.get_device_name(0) if cuda_ok else "N/A",
-        "vram_used_gb":  vram_used,
-        "vram_total_gb": vram_total,
-        "vram_free_gb":  vram_free,
-        "jobs":          dict(jobs_summary),
-        "model_path":    os.getenv("MODEL_PATH", "not set"),
-        "n_ctx":         int(os.getenv("N_CTX", "65536")),
+        "status":           "ok",
+        "qwen_loaded":      _qwen is not None,          # ← fix: was model_loaded/_llm
+        "glm_ocr_loaded":   _glm_model is not None,     # ← new field
+        "cuda":             cuda_ok,
+        "gpu":              torch.cuda.get_device_name(0) if cuda_ok else "N/A",
+        "vram_used_gb":     vram_used,
+        "vram_total_gb":    vram_total,
+        "vram_free_gb":     vram_free,
+        "jobs":             dict(jobs_summary),
+        "model_path":       os.getenv("MODEL_PATH", "not set"),
+        "glm_ocr_path":     os.getenv("GLM_OCR_PATH", "not set"),
     }
 
 
@@ -255,10 +255,11 @@ def health():
 @app.get("/info", tags=["System"], summary="API Info")
 def info():
     return {
-        "version":        "3.0.0",
-        "model":          "Qwen2.5-Coder-14B-Instruct Q4_K_M GGUF",
-        "async_endpoint": "POST /parse/submit  →  GET /parse/result/{job_id}",
-        "sync_endpoint":  "POST /parse  (90s timeout — may fail on large PDFs)",
-        "n_ctx":          int(os.getenv("N_CTX", "65536")),
-        "max_new_tokens": int(os.getenv("MAX_NEW_TOKENS", "16384")),
+        "version":            "4.0.0",
+        "header_model":       "Qwen2.5-Coder-14B-Instruct Q4_K_M GGUF",
+        "transaction_model":  "GLM-OCR (zai-org/GLM-OCR)",
+        "async_endpoint":     "POST /parse/submit → GET /parse/result/{job_id}",
+        "sync_endpoint":      "POST /parse  (90s timeout)",
+        "glm_max_new_tokens": int(os.getenv("GLM_MAX_NEW_TOKENS", "2048")),
+        "page_dpi":           int(os.getenv("PAGE_DPI", "150")),
     }
