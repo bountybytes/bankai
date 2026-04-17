@@ -99,3 +99,18 @@ def extract_text_plain(pdf_path: str) -> str:
     pages = [page.get_text("text") for page in doc]
     doc.close()
     return "\n".join(pages)
+
+def extract_header_text(pdf_path: str) -> str:
+    """
+    Extract plain text from the FIRST 2 pages only — used for account header parsing.
+    SBI and most Indian banks put account details on page 1 before the transaction table.
+    Returns plain text (not pipe-delimited) so Qwen can read it naturally.
+    """
+    doc = fitz.open(pdf_path)
+    pages_text = []
+    for i, page in enumerate(doc):
+        if i >= 2:   # only first 2 pages
+            break
+        pages_text.append(page.get_text("text").strip())
+    doc.close()
+    return "\n\n".join(pages_text)
