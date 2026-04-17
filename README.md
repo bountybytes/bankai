@@ -518,6 +518,70 @@ pip install https://github.com/jllllll/bitsandbytes-windows-webui/releases/downl
 
 MIT License — free to use, modify, and distribute.
 
+
+## Runpod Setup
+Step 1 — System & CUDA Check
+Run these in your RunPod terminal first to verify the GPU environment:
+
+bash
+# GPU + CUDA driver
+nvidia-smi
+
+# CUDA toolkit version
+nvcc --version
+
+# Python version check
+python3 --version   # needs 3.10+
+
+# Confirm CUDA visible to PyTorch
+python3 -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0)); print('VRAM:', round(torch.cuda.get_device_properties(0).total_memory/1e9,1), 'GB')"
+Step 2 — Install PyTorch with CUDA
+bash
+# Uninstall any CPU-only torch first
+pip uninstall torch torchvision torchaudio -y
+
+# Install CUDA 12.1 build (matches RunPod default drivers)
+pip install torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Verify
+python3 -c "import torch; print(torch.__version__); print('CUDA:', torch.cuda.is_available())"
+Step 3 — Install All Dependencies
+bash
+pip install \
+    fastapi>=0.111.0 \
+    "uvicorn[standard]>=0.29.0" \
+    python-multipart \
+    python-dotenv \
+    "pymupdf>=1.24.0" \
+    "Pillow>=10.0.0" \
+    "pydantic>=2.0.0" \
+    transformers \
+    accelerate \
+    huggingface_hub
+
+# llama-cpp-python — compiled with CUDA offload
+CMAKE_ARGS="-DGGML_CUDA=on" \
+FORCE_CMAKE=1 \
+pip install llama-cpp-python --no-cache-dir --force-reinstall
+
+# Verify llama-cpp sees CUDA
+python3 -c "from llama_cpp import Llama; print('llama-cpp-python OK')"
+
+Step 7 — Start the API
+bash
+cd /workspace/bank_ai
+
+# Start with uvicorn (port 8000)
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+
+# OR with PM2 to auto-restart on crash
+pm2 start "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1" \
+    --name bank-ai \
+    --interpreter none
+pm2 save
+pm2 logs bank-ai
+
 ---
 
 *Built with FastAPI · Qwen2.5 · PyMuPDF · HuggingFace Transformers*
