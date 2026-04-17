@@ -1,29 +1,24 @@
 """
-main.py — FastAPI application for Bank Statement AI
-Model : Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-GGUF (Q4_K_M)
-Run   : python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+main.py — FastAPI Bank Statement AI
+Async job polling pattern to bypass RunPod/Cloudflare 100s timeout
 """
 
-import os
-import tempfile
-import time
-import logging
-import uuid
+import os, tempfile, time, logging, uuid, asyncio
 from collections import Counter
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.extractor    import extract_text, anonymize_sensitive, restore_sensitive
-from app.parser       import parse_header, parse_transactions, load_model
-from app.categorizer  import categorize_transactions
-from app.schemas      import ParseResponse
+from app.extractor   import extract_text, anonymize_sensitive, restore_sensitive
+from app.parser      import parse_header, parse_transactions, load_model
+from app.categorizer import categorize_transactions
+from app.schemas     import ParseResponse
 
-# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level   = logging.INFO,
     format  = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -31,235 +26,245 @@ logging.basicConfig(
 )
 log = logging.getLogger("bank_ai.main")
 
+# ── In-memory job store ────────────────────────────────────────────────────────
+# { job_id: { "status": "processing"|"done"|"error", "result": {...}, "error": "..." } }
+_jobs: dict = {}
+_executor   = ThreadPoolExecutor(max_workers=1)  # 1 GPU — serialize inference
 
-# ── Lifespan — load model at startup ──────────────────────────────────────────
+
+# ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("=" * 60)
-    log.info("STARTUP  — Bank Statement AI (AWQ)")
-    log.info(f"  Model  : {os.getenv('GGUF_MODEL_PATH', 'Qwen3.5-27B Q4_K_M')}")
-    log.info(f"  n_ctx  : {os.getenv('N_CTX', '32768')}")
-    log.info("Loading GGUF model into VRAM (~22 GB)/Loading AWQ model into VRAM (~20 GB)")
+    log.info("STARTUP  — Bank Statement AI (GGUF)")
+    log.info(f"  Model  : {os.getenv('MODEL_PATH', 'not set')}")
+    log.info(f"  n_ctx  : {os.getenv('N_CTX', '65536')}")
+    log.info("Loading Qwen2.5-Coder-14B GGUF (~9 GB) ...")
     load_model()
     log.info("Model ready ✓  Server is now accepting requests.")
     log.info("=" * 60)
     yield
-    log.info("SHUTDOWN — releasing GPU resources.")
+    log.info("SHUTDOWN — releasing resources.")
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title       = "Bank Statement AI",
     description = """
-## Automated Bank Statement Parser — powered by Qwen3.5-27B (GGUF Q4_K_M)
+## Automated Bank Statement Parser — Qwen2.5-Coder-14B GGUF
 
-Upload any digital Indian bank statement PDF and receive:
+Upload any digital Indian bank statement PDF and receive structured JSON.
 
-- ✅ **Structured account details** — holder, account number, IFSC, PAN, branch
-- ✅ **All transactions** — dates, amounts, cheque/reference numbers, running balance
-- ✅ **Auto-assigned spending categories** — 21 categories via regex rules
-- ✅ **Financial summary** — total debits, credits, net flow
-- ✅ **Pipeline timings** — PDF extraction, LLM inference, categorisation
-
-### Supported Banks
-Axis Bank · HDFC · SBI · ICICI · Kotak · Yes Bank · IndusInd · PNB · Bank of Baroda · Canara · Federal Bank · and more
-
-### Privacy
-All processing is **100% local** — no data sent to any third-party API.
-PAN numbers and mobile numbers are anonymised before reaching the LLM.
+### ⚡ Use Async Endpoints to avoid timeouts
+- `POST /parse/submit` — submit job, returns `job_id` instantly
+- `GET  /parse/result/{job_id}` — poll until `status: done`
+- `POST /parse` — sync (only for < 60s statements, may 524 timeout)
 """,
-    version     = "2.0.0",
-    contact     = {"name": "Rahul Hrushikesh"},
-    license_info= {"name": "MIT"},
-    openapi_tags= [
-        {"name": "Parsing", "description": "Core PDF upload and AI extraction endpoints."},
-        {"name": "System",  "description": "Health check, CUDA status, and server diagnostics."},
-    ],
+    version     = "3.0.0",
     lifespan    = lifespan,
 )
 
 
-# ── POST /parse ────────────────────────────────────────────────────────────────
-@app.post(
-    "/parse",
-    tags            = ["Parsing"],
-    response_model  = ParseResponse,
-    summary         = "Parse Bank Statement PDF",
-    description     = """
-Upload a bank statement PDF. The pipeline runs in 4 stages:
-
-1. **PDF Extraction** — PyMuPDF extracts raw text (~0.1s)
-2. **Anonymisation** — PAN / mobile numbers redacted before LLM sees them
-3. **LLM Inference** — Qwen3.5-27B GGUF parses header + all transactions (~15–40s)
-4. **Categorisation** — Regex rules assign spending categories (~1ms)
-""",
-    responses       = {
-        200: {"description": "Successfully parsed bank statement"},
-        400: {"description": "Invalid file — only PDF accepted",
-              "content": {"application/json": {"example": {"detail": "Only PDF files supported"}}}},
-        500: {"description": "LLM inference or extraction failed"},
-    },
-)
-async def parse_statement(
-    file: UploadFile = File(..., description="Bank statement PDF (digital, not scanned)")
-):
+# ── Core pipeline (runs in thread) ────────────────────────────────────────────
+def _run_pipeline(pdf_bytes: bytes, filename: str) -> dict:
     req_id = uuid.uuid4().hex[:8]
-    log.info(f"[{req_id}] ── NEW REQUEST ──────────────────────────────")
-    log.info(f"[{req_id}] File : {file.filename}  ({file.content_type})")
-
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files supported")
-
+    log.info(f"[{req_id}] ── NEW REQUEST ── {filename}")
     t0 = time.time()
 
-    # ── Stage 1: PDF extraction ────────────────────────────────────────────────
-    log.info(f"[{req_id}] Stage 1 — PDF extraction")
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
-
-        raw_text = extract_text(tmp_path)
-        os.unlink(tmp_path)
-        log.info(f"[{req_id}]   Extracted {len(raw_text):,} chars from {len(content)/1024:.1f} KB PDF")
-    except Exception as e:
-        log.error(f"[{req_id}] Stage 1 FAILED: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"PDF extraction error: {e}")
+    # Stage 1 — PDF extraction
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+    raw_text = extract_text(tmp_path)
+    os.unlink(tmp_path)
+    log.info(f"[{req_id}] Extracted {len(raw_text):,} chars  ({len(pdf_bytes)/1024:.1f} KB)")
     t1 = time.time()
-    log.info(f"[{req_id}]   ✓ {t1 - t0:.3f}s")
 
-    # ── Stage 2: Anonymise sensitive fields ────────────────────────────────────
+    # Stage 2 — Anonymise
     anon_text, restore_map = anonymize_sensitive(raw_text)
-    log.info(f"[{req_id}] Stage 2 — Anonymised {len(restore_map)} sensitive fields")
+    log.info(f"[{req_id}] Anonymised {len(restore_map)} sensitive fields")
 
-    # ── Stage 3: LLM inference ─────────────────────────────────────────────────
-    log.info(f"[{req_id}] Stage 3 — LLM inference")
-    try:
-        log.info(f"[{req_id}]   Parsing header...")
-        acc_details  = parse_header(anon_text)
-        acc_details  = restore_sensitive(acc_details, restore_map)
+    # Stage 3 — LLM inference
+    log.info(f"[{req_id}] Parsing header ...")
+    acc_details  = parse_header(anon_text)
+    acc_details  = restore_sensitive(acc_details, restore_map)
+    log.info(f"[{req_id}] Header → account: {acc_details.get('account_number','N/A')}  holder: {acc_details.get('account_holder','N/A')}")
 
-        log.info(f"[{req_id}]   Header  → account: {acc_details.get('account_number', 'N/A')}  holder: {acc_details.get('account_holder', 'N/A')}")
-
-        log.info(f"[{req_id}]   Parsing transactions ({len(anon_text):,} chars)...")
-        transactions = parse_transactions(anon_text)
-        transactions = [restore_sensitive(t, restore_map) for t in transactions]
-
-        log.info(f"[{req_id}]   Transactions → {len(transactions)} rows found")
-    except Exception as e:
-        log.error(f"[{req_id}] Stage 3 FAILED: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"LLM inference error: {e}")
+    log.info(f"[{req_id}] Parsing transactions ({len(anon_text):,} chars) ...")
+    transactions = parse_transactions(anon_text)
+    transactions = [restore_sensitive(t, restore_map) for t in transactions]
+    log.info(f"[{req_id}] Transactions → {len(transactions)} rows")
     t2 = time.time()
-    log.info(f"[{req_id}]   ✓ {t2 - t1:.3f}s")
 
-    # ── Stage 4: Categorisation ────────────────────────────────────────────────
-    log.info(f"[{req_id}] Stage 4 — Categorising {len(transactions)} transactions")
+    # Stage 4 — Categorise
     transactions = categorize_transactions(transactions)
     cats = Counter(t.get("category", "Other") for t in transactions)
     for cat, count in cats.most_common():
         log.info(f"[{req_id}]   {cat:<30} {count} txns")
     t3 = time.time()
-    log.info(f"[{req_id}]   ✓ {(t3 - t2) * 1000:.2f}ms")
 
-    # ── Build summary ──────────────────────────────────────────────────────────
+    # Summary
     debits, credits = [], []
     for txn in transactions:
         try:
-            if txn.get("debit")  and str(txn["debit"]).strip():
-                debits.append(float(txn["debit"]))
-            if txn.get("credit") and str(txn["credit"]).strip():
-                credits.append(float(txn["credit"]))
+            if txn.get("debit")  and str(txn["debit"]).strip():  debits.append(float(txn["debit"]))
+            if txn.get("credit") and str(txn["credit"]).strip(): credits.append(float(txn["credit"]))
         except (ValueError, TypeError):
             pass
 
-    summary = {
-        "total_transactions": len(transactions),
-        "total_debit":        round(sum(debits),   2),
-        "total_credit":       round(sum(credits),  2),
-        "net_flow":           round(sum(credits) - sum(debits), 2),
-    }
-
     total_s = round(time.time() - t0, 3)
-    log.info(f"[{req_id}] ── COMPLETE ─────────────────────────────────")
-    log.info(f"[{req_id}] Transactions : {summary['total_transactions']}")
-    log.info(f"[{req_id}] Total Debit  : ₹{summary['total_debit']:,.2f}")
-    log.info(f"[{req_id}] Total Credit : ₹{summary['total_credit']:,.2f}")
-    log.info(f"[{req_id}] Net Flow     : ₹{summary['net_flow']:,.2f}")
-    log.info(f"[{req_id}] Total Time   : {total_s}s  (pdf={t1-t0:.3f}s  llm={t2-t1:.3f}s  cat={(t3-t2)*1000:.2f}ms)")
+    log.info(f"[{req_id}] COMPLETE — {len(transactions)} txns  {total_s}s total")
 
-    return JSONResponse(content={
-        "account_details":  acc_details,
-        "transactions":     transactions,
-        "summary":          summary,
-        "source_file":      file.filename,
+    return {
+        "account_details": acc_details,
+        "transactions":    transactions,
+        "summary": {
+            "total_transactions": len(transactions),
+            "total_debit":        round(sum(debits), 2),
+            "total_credit":       round(sum(credits), 2),
+            "net_flow":           round(sum(credits) - sum(debits), 2),
+        },
+        "source_file":      filename,
         "used_image_mode":  False,
         "timings": {
-            "pdf_extraction_s": round(t1 - t0,  3),
-            "llm_inference_s":  round(t2 - t1,  3),
-            "categorization_ms":round((t3 - t2) * 1000, 2),
-            "total_s":          total_s,
+            "pdf_extraction_s":  round(t1 - t0, 3),
+            "llm_inference_s":   round(t2 - t1, 3),
+            "categorization_ms": round((t3 - t2) * 1000, 2),
+            "total_s":           total_s,
         },
-    })
+    }
+
+
+# ── POST /parse/submit  (RECOMMENDED — async, no timeout) ─────────────────────
+@app.post("/parse/submit", tags=["Parsing"],
+    summary="Submit PDF for async parsing (no timeout)",
+    description="Returns a `job_id` immediately. Poll `GET /parse/result/{job_id}` until `status` is `done`.")
+async def parse_submit(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="Bank statement PDF"),
+):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files supported")
+
+    job_id    = uuid.uuid4().hex[:12]
+    pdf_bytes = await file.read()
+    filename  = file.filename
+
+    _jobs[job_id] = {"status": "processing", "submitted_at": time.time()}
+    log.info(f"[job:{job_id}] Submitted — {filename}  ({len(pdf_bytes)/1024:.1f} KB)")
+
+    # Run in background thread (non-blocking for uvicorn)
+    loop = asyncio.get_event_loop()
+    async def _bg():
+        try:
+            result = await loop.run_in_executor(_executor, _run_pipeline, pdf_bytes, filename)
+            _jobs[job_id] = {"status": "done", "result": result, "completed_at": time.time()}
+        except Exception as e:
+            log.error(f"[job:{job_id}] FAILED: {e}", exc_info=True)
+            _jobs[job_id] = {"status": "error", "error": str(e)}
+
+    background_tasks.add_task(_bg)
+
+    return {
+        "job_id":    job_id,
+        "status":    "processing",
+        "poll_url":  f"/parse/result/{job_id}",
+        "message":   "Poll /parse/result/{job_id} every 5 seconds until status is 'done'",
+    }
+
+
+# ── GET /parse/result/{job_id}  ────────────────────────────────────────────────
+@app.get("/parse/result/{job_id}", tags=["Parsing"],
+    summary="Poll job result",
+    description="Returns `status: processing` while running, `status: done` with full result when complete.")
+def parse_result(job_id: str):
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+    job = _jobs[job_id]
+
+    if job["status"] == "processing":
+        elapsed = round(time.time() - job["submitted_at"], 1)
+        return {"status": "processing", "elapsed_s": elapsed, "job_id": job_id}
+
+    if job["status"] == "error":
+        return JSONResponse(status_code=500, content={"status": "error", "error": job["error"]})
+
+    return {"status": "done", "job_id": job_id, **job["result"]}
+
+
+# ── GET /parse/jobs  ───────────────────────────────────────────────────────────
+@app.get("/parse/jobs", tags=["Parsing"], summary="List all jobs")
+def list_jobs():
+    return {
+        jid: {"status": j["status"], "elapsed_s": round(time.time() - j.get("submitted_at", time.time()), 1)}
+        for jid, j in _jobs.items()
+    }
+
+
+# ── POST /parse  (sync — kept for compatibility, may 524 on large PDFs) ────────
+@app.post("/parse", tags=["Parsing"],
+    summary="Sync parse (use /parse/submit for large PDFs)",
+    description="⚠️ May 524 timeout via RunPod proxy for large statements. Use `/parse/submit` instead.")
+async def parse_sync(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files supported")
+
+    pdf_bytes = await file.read()
+    loop      = asyncio.get_event_loop()
+
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(_executor, _run_pipeline, pdf_bytes, file.filename),
+            timeout=90.0,
+        )
+        return JSONResponse(content=result)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="LLM inference exceeded 90s. Use POST /parse/submit + GET /parse/result/{job_id} instead."
+        )
 
 
 # ── GET /health ────────────────────────────────────────────────────────────────
-@app.get(
-    "/health",
-    tags        = ["System"],
-    summary     = "Server Health Check",
-    description = "Returns CUDA availability, GPU name, free VRAM, and model load status.",
-)
+@app.get("/health", tags=["System"], summary="Health Check")
 def health():
     import torch
     from app.parser import _llm
 
-    cuda_ok    = torch.cuda.is_available()
-    vram_free  = vram_total = vram_used = 0.0
+    cuda_ok = torch.cuda.is_available()
+    vram_free = vram_total = vram_used = 0.0
     if cuda_ok:
         free_b, total_b = torch.cuda.mem_get_info(0)
         vram_free  = round(free_b  / 1e9, 2)
         vram_total = round(total_b / 1e9, 2)
         vram_used  = round((total_b - free_b) / 1e9, 2)
 
-    result = {
-        "status":       "ok",
-        "cuda":         cuda_ok,
-        "gpu":          torch.cuda.get_device_name(0) if cuda_ok else "N/A",
-        "vram_free_gb": vram_free,
-        "vram_total_gb":vram_total,
-        "vram_used_gb": vram_used,
-        "model_path":   os.getenv("GGUF_MODEL_PATH", "not set"),
-        "model_loaded": _llm is not None,
-        "n_ctx":        int(os.getenv("N_CTX", "32768")),
+    jobs_summary = Counter(j["status"] for j in _jobs.values())
+    log.info(f"[health] VRAM {vram_used}/{vram_total} GB  loaded={_llm is not None}")
+
+    return {
+        "status":        "ok",
+        "model_loaded":  _llm is not None,
+        "cuda":          cuda_ok,
+        "gpu":           torch.cuda.get_device_name(0) if cuda_ok else "N/A",
+        "vram_used_gb":  vram_used,
+        "vram_total_gb": vram_total,
+        "vram_free_gb":  vram_free,
+        "jobs":          dict(jobs_summary),
+        "model_path":    os.getenv("MODEL_PATH", "not set"),
+        "n_ctx":         int(os.getenv("N_CTX", "65536")),
     }
-    log.info(f"[health] VRAM {vram_used}/{vram_total} GB  loaded={result['model_loaded']}")
-    return result
 
 
 # ── GET /info ──────────────────────────────────────────────────────────────────
-@app.get(
-    "/info",
-    tags        = ["System"],
-    summary     = "API Info",
-    description = "Returns model config, supported categories, and pipeline metadata.",
-)
+@app.get("/info", tags=["System"], summary="API Info")
 def info():
-    from app.categorizer import CATEGORY_RULES
     return {
-        "version":             "2.0.0",
-        "model":               "Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-GGUF Q4_K_M",
-        "model_path":          os.getenv("GGUF_MODEL_PATH", "not set"),
-        "n_ctx":               int(os.getenv("N_CTX", "32768")),
-        "n_gpu_layers":        int(os.getenv("N_GPU_LAYERS", "-1")),
-        "max_new_tokens":      os.getenv("MAX_NEW_TOKENS", "0 (unlimited)"),
-        "max_txn_chars":       int(os.getenv("MAX_TXN_CHARS", "30000")),
-        "supported_categories":[rule[1] for rule in CATEGORY_RULES],
-        "privacy":             "100% local — no data sent to external APIs",
-        "pipeline_stages": [
-            {"stage": 1, "name": "PDF Extraction",    "tool": "PyMuPDF",              "avg_time": "~0.1s"},
-            {"stage": 2, "name": "Anonymisation",     "tool": "Regex (PAN/Mobile)",   "avg_time": "<1ms"},
-            {"stage": 3, "name": "LLM Inference",     "tool": "Qwen3.5-27B GGUF",    "avg_time": "~15–40s"},
-            {"stage": 4, "name": "Categorisation",    "tool": "Regex Rules (21 cats)","avg_time": "~1ms"},
-        ],
+        "version":        "3.0.0",
+        "model":          "Qwen2.5-Coder-14B-Instruct Q4_K_M GGUF",
+        "async_endpoint": "POST /parse/submit  →  GET /parse/result/{job_id}",
+        "sync_endpoint":  "POST /parse  (90s timeout — may fail on large PDFs)",
+        "n_ctx":          int(os.getenv("N_CTX", "65536")),
+        "max_new_tokens": int(os.getenv("MAX_NEW_TOKENS", "16384")),
     }
