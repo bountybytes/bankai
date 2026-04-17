@@ -68,39 +68,34 @@ Upload any digital Indian bank statement PDF and receive structured JSON.
 # ── Core pipeline (runs in thread) ────────────────────────────────────────────
 def _run_pipeline(pdf_bytes: bytes, filename: str) -> dict:
     req_id = uuid.uuid4().hex[:8]
-    log.info(f"[{req_id}] ── NEW REQUEST ── {filename}")
     t0 = time.time()
 
-    # Stage 1 — PDF extraction
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
+    # ── Save PDF — keep alive for GLM-OCR page rendering ──
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.write(pdf_bytes)
+    tmp.flush()
+    tmp_path = tmp.name
+    tmp.close()                          # close handle but DON'T delete yet
+
     raw_text = extract_text(tmp_path)
-    os.unlink(tmp_path)
-    log.info(f"[{req_id}] Extracted {len(raw_text):,} chars  ({len(pdf_bytes)/1024:.1f} KB)")
     t1 = time.time()
 
-    # Stage 2 — Anonymise
     anon_text, restore_map = anonymize_sensitive(raw_text)
-    log.info(f"[{req_id}] Anonymised {len(restore_map)} sensitive fields")
 
-    # Stage 3 — LLM inference
-    log.info(f"[{req_id}] Parsing header ...")
-    acc_details  = parse_header(anon_text)
-    acc_details  = restore_sensitive(acc_details, restore_map)
-    log.info(f"[{req_id}] Header → account: {acc_details.get('account_number','N/A')}  holder: {acc_details.get('account_holder','N/A')}")
+    # Header — Qwen (text only, ~512 tokens out)
+    acc_details = parse_header(anon_text)
+    acc_details = restore_sensitive(acc_details, restore_map)
 
-    log.info(f"[{req_id}] Parsing transactions ({len(anon_text):,} chars) ...")
-    transactions = parse_transactions(anon_text)
+    # Transactions — GLM-OCR (pass pdf_path so it can render pages)
+    transactions = parse_transactions(anon_text, pdf_path=tmp_path)
     transactions = [restore_sensitive(t, restore_map) for t in transactions]
-    log.info(f"[{req_id}] Transactions → {len(transactions)} rows")
     t2 = time.time()
 
-    # Stage 4 — Categorise
+    os.unlink(tmp_path)                  # ← delete AFTER inference completes
+
+    # Categorise
     transactions = categorize_transactions(transactions)
     cats = Counter(t.get("category", "Other") for t in transactions)
-    for cat, count in cats.most_common():
-        log.info(f"[{req_id}]   {cat:<30} {count} txns")
     t3 = time.time()
 
     # Summary
