@@ -46,15 +46,20 @@ def _load_glm():
     if _glm_model is not None:
         return
     import torch
-    from transformers import AutoProcessor, AutoModelForCausalLM
+    from transformers import AutoProcessor, AutoModel
+
     log.info(f"Loading GLM-OCR: {GLM_OCR_PATH}")
+
     _glm_processor = AutoProcessor.from_pretrained(
         GLM_OCR_PATH,
         trust_remote_code=True,
     )
-    _glm_model = AutoModelForCausalLM.from_pretrained(
+
+    # GLM-OCR uses AutoModel, not AutoModelForCausalLM
+    # It has a custom GlmOcrConfig that only registers under AutoModel
+    _glm_model = AutoModel.from_pretrained(
         GLM_OCR_PATH,
-        torch_dtype   = torch.float16,
+        dtype         = torch.float16,
         device_map    = "auto",
         trust_remote_code = True,
     )
@@ -140,24 +145,20 @@ def _render_page(pdf_path: str, page_num: int):
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 def _glm_ocr_page(pdf_path: str, page_num: int) -> str:
-    """
-    Run GLM-OCR on a single page image.
-    Returns raw OCR text string (not JSON).
-    GLM-OCR is a document OCR model — we use it for text extraction,
-    then pass that text to Qwen for JSON structuring.
-    """
     import torch
     _load_glm()
 
     img = _render_page(pdf_path, page_num)
 
-    # GLM-OCR correct input format: pass PIL image directly to processor
-    # Use a simple OCR instruction prompt
     inputs = _glm_processor(
         text   = "Transcribe ALL text in this image exactly as it appears, preserving table structure with spaces.",
         images = img,
         return_tensors = "pt",
     ).to(_glm_model.device)
+
+    # Some processors don't set pad_token_id — use eos as fallback
+    pad_id = getattr(_glm_processor.tokenizer, "pad_token_id", None) \
+          or getattr(_glm_processor.tokenizer, "eos_token_id", 0)
 
     t0 = time.time()
     with torch.no_grad():
@@ -165,21 +166,19 @@ def _glm_ocr_page(pdf_path: str, page_num: int) -> str:
             **inputs,
             max_new_tokens = GLM_MAX_NEW,
             do_sample      = False,
-            temperature    = 1.0,
-            pad_token_id   = _glm_processor.tokenizer.eos_token_id,
+            pad_token_id   = pad_id,
         )
     elapsed = time.time() - t0
 
-    # Decode only new tokens, strip special tokens this time
     input_len = inputs["input_ids"].shape[1]
     ocr_text  = _glm_processor.decode(
         out_ids[0][input_len:],
-        skip_special_tokens = True,  # ← FIXED: was False
+        skip_special_tokens = True,
     ).strip()
 
     out_tokens = out_ids.shape[1] - input_len
     log.info(f"[glm-page-{page_num+1}] OCR: {out_tokens} tokens in {elapsed:.1f}s  ({len(ocr_text)} chars)")
-    log.debug(f"[glm-page-{page_num+1}] OCR preview: {ocr_text[:300]}")
+    log.debug(f"[glm-page-{page_num+1}] OCR preview:\n{ocr_text[:400]}")
     return ocr_text
 
 def _qwen_parse_ocr(ocr_text: str, page_label: str) -> list:
