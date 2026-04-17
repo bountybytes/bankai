@@ -36,10 +36,9 @@ _executor   = ThreadPoolExecutor(max_workers=1)  # 1 GPU — serialize inference
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("=" * 60)
-    log.info("STARTUP  — Bank Statement AI (GGUF)")
-    log.info(f"  Model  : {os.getenv('MODEL_PATH', 'not set')}")
-    log.info(f"  n_ctx  : {os.getenv('N_CTX', '65536')}")
-    log.info("Loading Qwen2.5-Coder-14B GGUF (~9 GB) ...")
+    log.info("STARTUP — Bank Statement AI (GLM-OCR + Qwen GGUF)")
+    log.info(f"  Qwen   : {os.getenv('MODEL_PATH')}")
+    log.info(f"  GLM-OCR: {os.getenv('GLM_OCR_PATH')}")
     load_model()
     log.info("Model ready ✓  Server is now accepting requests.")
     log.info("=" * 60)
