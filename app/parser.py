@@ -18,7 +18,7 @@ N_GPU_LAYERS     = int(os.getenv("N_GPU_LAYERS",      "-1"))
 N_CTX            = int(os.getenv("N_CTX",             "8192"))
 MAX_HEADER_CHARS = int(os.getenv("MAX_HEADER_CHARS",  "8000"))
 GLM_MAX_NEW      = int(os.getenv("GLM_MAX_NEW_TOKENS", "8192"))
-PAGE_DPI         = int(os.getenv("PAGE_DPI",          "200"))
+PAGE_DPI         = int(os.getenv("PAGE_DPI",          "150"))
 
 _qwen          = None
 _glm_model     = None
@@ -46,16 +46,22 @@ def _load_glm():
     if _glm_model is not None:
         return
     import torch
-    # ✅ Correct class: GlmOcrForConditionalGeneration (native in transformers, no trust_remote_code needed)
     from transformers import AutoProcessor, GlmOcrForConditionalGeneration
     log.info(f"Loading GLM-OCR: {GLM_OCR_PATH}")
     _glm_processor = AutoProcessor.from_pretrained(GLM_OCR_PATH)
     _glm_model = GlmOcrForConditionalGeneration.from_pretrained(
         GLM_OCR_PATH,
-        dtype      = torch.bfloat16,
-        device_map = "auto",
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="flash_attention_2",  # ✅ ADD THIS
     )
     _glm_model.eval()
+    if hasattr(torch, "compile"):
+    try:
+        _glm_model = torch.compile(_glm_model, mode="reduce-overhead")
+        log.info("GLM-OCR: torch.compile applied ✓")
+    except Exception as e:
+        log.warning(f"torch.compile skipped: {e}")
     log.info("GLM-OCR ready ✓")
 
 def load_model():
@@ -125,6 +131,14 @@ Rules:
 OCR TEXT:
 """
 
+def _estimate_max_tokens(img) -> int:
+    """Estimate OCR output tokens from image height (proxy for row count)."""
+    # ~4 tokens per transaction row, ~10 rows per 400px of height at 150 DPI
+    height = img.size[1]
+    estimated_rows = max(10, height // 40)       # ~1 row per 40px
+    tokens = min(4096, max(512, estimated_rows * 60))  # 60 tokens/row, cap at 4096
+    return tokens
+
 # ── GLM-OCR: page image → OCR text ────────────────────────────────────────────
 def _render_page(pdf_path: str, page_num: int):
     """Render a PDF page to a PIL Image."""
@@ -164,7 +178,7 @@ def _glm_ocr_page(pdf_path: str, page_num: int) -> str:
 
     t0 = time.time()
     with torch.no_grad():
-        generated_ids = _glm_model.generate(**inputs, max_new_tokens=GLM_MAX_NEW)
+        generated_ids = _glm_model.generate(**inputs, max_new_tokens=_estimate_max_tokens(img))
     elapsed = time.time() - t0
 
     input_len = inputs["input_ids"].shape[1]
@@ -210,25 +224,113 @@ def parse_transactions(text: str, pdf_path: str = None) -> list:
     log.warning("pdf_path not provided — Qwen text-only fallback")
     return _parse_with_qwen_text(text)
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 def _parse_with_glm_plus_qwen(pdf_path: str) -> list:
     import fitz
-    doc     = fitz.open(pdf_path)
+    doc = fitz.open(pdf_path)
     n_pages = len(doc)
     doc.close()
     log.info(f"[pipeline] GLM-OCR + Qwen — {n_pages} pages")
 
+    # ── Phase 1: Render all pages to PIL Images (CPU, fast) ──
+    images = [_render_page(pdf_path, i) for i in range(n_pages)]
+
+    # ── Phase 2: Batch all pages through GLM-OCR in one forward pass ──
+    # Build all inputs first, then generate together (true batching)
+    ocr_results = [None] * n_pages
+    try:
+        ocr_results = _glm_ocr_batch(images)
+    except Exception as e:
+        log.warning(f"[pipeline] Batch OCR failed ({e}), falling back to serial")
+        ocr_results = [_glm_ocr_page_from_image(img, i) for i, img in enumerate(images)]
+
+    # ── Phase 3: Qwen parses each page's OCR text (serial, GGUF) ──
     all_txns = []
-    for page_num in range(n_pages):
-        label    = f"page-{page_num+1}/{n_pages}"
-        ocr_text = _glm_ocr_page(pdf_path, page_num)       # Vision → text
-        rows     = _qwen_parse_ocr(ocr_text, label)        # Text → JSON
-        rows     = _post_process(rows)
-        before   = len(all_txns)
+    for page_num, ocr_text in enumerate(ocr_results):
+        label = f"page-{page_num+1}/{n_pages}"
+        rows = _qwen_parse_ocr(ocr_text, label)
+        rows = _post_process(rows)
+        before = len(all_txns)
         all_txns = _dedupe(all_txns + rows)
-        log.info(f"[{label}] +{len(all_txns)-before} new rows  total={len(all_txns)}")
+        log.info(f"[{label}] +{len(all_txns)-before} new rows total={len(all_txns)}")
 
     log.info(f"[pipeline] DONE — {len(all_txns)} transactions")
     return all_txns
+
+
+def _glm_ocr_batch(images: list) -> list:
+    """
+    True batched GLM-OCR: process all page images in a single GPU forward pass.
+    Much faster than serial since it amortizes KV-cache prefill overhead.
+    """
+    import torch
+    _load_glm()
+
+    # Build per-image message lists
+    all_messages = [
+        [{"role": "user", "content": [
+            {"type": "image", "image": img},
+            {"type": "text",  "text": "Text Recognition:"},
+        ]}]
+        for img in images
+    ]
+
+    # Tokenize all pages — padding="longest" pads to match the longest page
+    inputs = _glm_processor.apply_chat_template(
+        all_messages,           # list of message-lists → batched
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+        padding=True,           # ✅ batch padding
+    ).to(_glm_model.device)
+    inputs.pop("token_type_ids", None)
+
+    # Estimate max tokens from the tallest image in the batch
+    max_new = max(_estimate_max_tokens(img) for img in images)
+    log.info(f"[glm-batch] {len(images)} pages, max_new_tokens={max_new}")
+
+    t0 = time.time()
+    with torch.no_grad():
+        generated_ids = _glm_model.generate(
+            **inputs,
+            max_new_tokens=max_new,
+        )
+    log.info(f"[glm-batch] done in {time.time()-t0:.1f}s")
+
+    # Decode each page separately
+    input_len = inputs["input_ids"].shape[1]
+    results = []
+    for i in range(len(images)):
+        text = _glm_processor.decode(
+            generated_ids[i][input_len:],
+            skip_special_tokens=False,
+        ).strip()
+        results.append(text)
+    return results
+
+
+def _glm_ocr_page_from_image(img, page_num: int) -> str:
+    """Serial fallback — single PIL Image → OCR text."""
+    import torch
+    _load_glm()
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": img},
+        {"type": "text",  "text": "Text Recognition:"},
+    ]}]
+    inputs = _glm_processor.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True,
+        return_dict=True, return_tensors="pt",
+    ).to(_glm_model.device)
+    inputs.pop("token_type_ids", None)
+    t0 = time.time()
+    with torch.no_grad():
+        generated_ids = _glm_model.generate(**inputs, max_new_tokens=_estimate_max_tokens(img))
+    input_len = inputs["input_ids"].shape[1]
+    ocr_text = _glm_processor.decode(generated_ids[0][input_len:], skip_special_tokens=False).strip()
+    log.info(f"[glm-page-{page_num+1}] OCR done in {time.time()-t0:.1f}s")
+    return ocr_text
 
 # ── Qwen header ────────────────────────────────────────────────────────────────
 def parse_header(header_text: str) -> dict:
