@@ -138,64 +138,44 @@ def _render_page(pdf_path: str, page_num: int):
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 def _glm_ocr_page(pdf_path: str, page_num: int) -> str:
-    """
-    Run GLM-OCR on one PDF page image → returns raw OCR text.
-    Uses the official GlmOcrForConditionalGeneration API pattern.
-    """
     import torch
     _load_glm()
 
-    img = _render_page(pdf_path, page_num)
+    img = _render_page(pdf_path, page_num)  # PIL Image — use directly
 
-    # Save page image to temp file — GLM-OCR expects a file URL in the message
-    tmp_img = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-    img.save(tmp_img.name)
-    tmp_img.close()
-
-    # ✅ Official GLM-OCR message format from HuggingFace docs
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "image", "url": tmp_img.name},
+                {"type": "image", "image": img},   # ✅ Pass PIL Image, NOT "url"
                 {"type": "text",  "text": "Text Recognition:"},
             ],
         }
     ]
 
-    try:
-        # ✅ Official pattern: apply_chat_template → generate → decode
-        inputs = _glm_processor.apply_chat_template(
-            messages,
-            tokenize              = True,
-            add_generation_prompt = True,
-            return_dict           = True,
-            return_tensors        = "pt",
-        ).to(_glm_model.device)
-        inputs.pop("token_type_ids", None)  # ✅ must remove — causes errors if present
+    inputs = _glm_processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(_glm_model.device)
+    inputs.pop("token_type_ids", None)
 
-        t0 = time.time()
-        with torch.no_grad():
-            generated_ids = _glm_model.generate(
-                **inputs,
-                max_new_tokens = GLM_MAX_NEW,
-            )
-        elapsed = time.time() - t0
+    t0 = time.time()
+    with torch.no_grad():
+        generated_ids = _glm_model.generate(**inputs, max_new_tokens=GLM_MAX_NEW)
+    elapsed = time.time() - t0
 
-        input_len  = inputs["input_ids"].shape[1]
-        # ✅ skip_special_tokens=False per official GLM-OCR example
-        ocr_text = _glm_processor.decode(
-            generated_ids[0][input_len:],
-            skip_special_tokens = False,
-        ).strip()
+    input_len = inputs["input_ids"].shape[1]
+    ocr_text = _glm_processor.decode(
+        generated_ids[0][input_len:],
+        skip_special_tokens=False,
+    ).strip()
 
-        out_tokens = generated_ids.shape[1] - input_len
-        log.info(f"[glm-page-{page_num+1}] OCR: {out_tokens} tokens in {elapsed:.1f}s  ({len(ocr_text)} chars)")
-        log.debug(f"[glm-page-{page_num+1}] OCR preview:\n{ocr_text[:500]}")
-        return ocr_text
-
-    finally:
-        os.unlink(tmp_img.name)
+    out_tokens = generated_ids.shape[1] - input_len
+    log.info(f"[glm-page-{page_num+1}] OCR: {out_tokens} tokens in {elapsed:.1f}s ({len(ocr_text)} chars)")
+    return ocr_text
 
 # ── Qwen: OCR text → structured JSON ──────────────────────────────────────────
 def _qwen_parse_ocr(ocr_text: str, page_label: str) -> list:
