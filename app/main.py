@@ -148,17 +148,6 @@ def _run_pipeline(pdf_bytes: bytes, filename: str) -> dict:
         },
     }
 
-def _offload_qwen_to_cpu():
-    """Temporarily move Qwen KV cache pressure off GPU before GLM-OCR."""
-    import torch, gc
-    # llama-cpp doesn't expose device move, but clearing CUDA cache frees
-    # reserved-but-unallocated pages that accumulate after Qwen inference
-    torch.cuda.empty_cache()
-    gc.collect()
-    free_b, total_b = torch.cuda.mem_get_info(0)
-    log.info(f"[vram-cleanup] After Qwen: {(total_b-free_b)/1e9:.2f} GB used, {free_b/1e9:.2f} GB free")
-    
-
 
 # ── POST /parse/submit  (RECOMMENDED — async, no timeout) ─────────────────────
 @app.post("/parse/submit", tags=["Parsing"],
