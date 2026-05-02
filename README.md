@@ -585,3 +585,38 @@ pm2 logs bank-ai
 ---
 
 *Built with FastAPI · Qwen2.5 · PyMuPDF · HuggingFace Transformers*
+
+
+mkdir -p /workspace/models
+cd /workspace/models
+
+pip install -U huggingface_hub
+
+hf auth login (optional)
+
+hf download Qwen/Qwen2.5-Coder-14B-Instruct-GGUF \
+  qwen2.5-coder-14b-instruct-q4_k_m.gguf \
+  --local-dir /workspace/models
+
+hf download zai-org/GLM-OCR \
+  --local-dir /workspace/models/GLM-OCR
+
+  ls -lh /workspace/models >>> qwen2.5-coder-14b-instruct-q4_k_m.gguf
+                                GLM-OCR/
+cd /worksapce/bankai
+pip install \
+  transformers \
+  accelerate \
+  sentencepiece \
+  torch \
+  torchvision \
+  pillow \
+  einops \
+  safetensors
+pip install bitsandbytes
+pip install -r requirements.txt
+
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+runpod external apis
+https://<pod-id>-8000.proxy.runpod.net/docs
