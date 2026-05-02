@@ -53,15 +53,15 @@ def _load_glm():
         GLM_OCR_PATH,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        attn_implementation="flash_attention_2",  # ✅ ADD THIS
+        attn_implementation="flash_attention_2",
     )
     _glm_model.eval()
     if hasattr(torch, "compile"):
-    try:
-        _glm_model = torch.compile(_glm_model, mode="reduce-overhead")
-        log.info("GLM-OCR: torch.compile applied ✓")
-    except Exception as e:
-        log.warning(f"torch.compile skipped: {e}")
+        try:
+            _glm_model = torch.compile(_glm_model, mode="reduce-overhead")
+            log.info("GLM-OCR: torch.compile applied ✓")
+        except Exception as e:
+            log.warning(f"torch.compile skipped: {e}")
     log.info("GLM-OCR ready ✓")
 
 def load_model():
