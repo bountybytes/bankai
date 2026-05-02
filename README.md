@@ -624,10 +624,11 @@ check in terminal if llama-cpp was compiled with CUDA:
 
 # bash
 python -c "import llama_cpp; print(llama_cpp.__file__)"
+
 # Then check:
 python -c "from llama_cpp import llama_supports_gpu_offload; print('GPU offload:', llama_supports_gpu_offload())"
-If it prints False, your llama-cpp was installed without CUDA support. Reinstall it:
 
+If it prints False, your llama-cpp was installed without CUDA support. Reinstall it:
 # bash
 CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir
 
