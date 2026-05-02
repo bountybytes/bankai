@@ -66,8 +66,17 @@ Upload any digital Indian bank statement PDF and receive structured JSON.
 
 # ── Core pipeline (runs in thread) ────────────────────────────────────────────
 def _run_pipeline(pdf_bytes: bytes, filename: str) -> dict:
+    import torch
     req_id = uuid.uuid4().hex[:8]
     t0 = time.time()
+
+    # ✅ GPU diagnostic at job start
+    if torch.cuda.is_available():
+        free_b, total_b = torch.cuda.mem_get_info(0)
+        log.info(f"[{req_id}] GPU: {torch.cuda.get_device_name(0)}")
+        log.info(f"[{req_id}] VRAM: {(total_b-free_b)/1e9:.2f} GB used / {total_b/1e9:.2f} GB total")
+    else:
+        log.error(f"[{req_id}] ⚠️ CUDA NOT AVAILABLE — running on CPU!")
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.write(pdf_bytes)

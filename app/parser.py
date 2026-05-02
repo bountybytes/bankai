@@ -29,16 +29,28 @@ def _load_qwen():
     global _qwen
     if _qwen is not None:
         return
+    import torch
     from llama_cpp import Llama
+
+    cuda_available = torch.cuda.is_available()
     log.info(f"Loading Qwen GGUF: {MODEL_PATH}")
+    log.info(f"  CUDA available: {cuda_available}")
+    log.info(f"  N_GPU_LAYERS: {N_GPU_LAYERS}")
+
     _qwen = Llama(
         model_path   = MODEL_PATH,
         n_ctx        = N_CTX,
-        n_gpu_layers = N_GPU_LAYERS,
-        n_threads    = 8,
+        n_gpu_layers = N_GPU_LAYERS,   # -1 = all layers to GPU
+        n_threads    = 4,              # fewer CPU threads when GPU is doing the work
         flash_attn   = True,
-        verbose      = False,
+        verbose      = True,           # ✅ TEMPORARILY enable to see GPU layer offload count
     )
+
+    # Verify GPU usage
+    if cuda_available:
+        free_b, total_b = torch.cuda.mem_get_info(0)
+        vram_used = round((total_b - free_b) / 1e9, 2)
+        log.info(f"  VRAM used after Qwen load: {vram_used} GB")
     log.info("Qwen2.5-Coder-14B ready ✓")
 
 def _load_glm():
@@ -48,6 +60,8 @@ def _load_glm():
     import torch
     from transformers import AutoProcessor, GlmOcrForConditionalGeneration
     log.info(f"Loading GLM-OCR: {GLM_OCR_PATH}")
+    log.info(f"  VRAM before GLM load: {_vram_used_gb():.2f} GB used")
+
     _glm_processor = AutoProcessor.from_pretrained(GLM_OCR_PATH)
     _glm_model = GlmOcrForConditionalGeneration.from_pretrained(
         GLM_OCR_PATH,
@@ -56,13 +70,15 @@ def _load_glm():
         attn_implementation="flash_attention_2",
     )
     _glm_model.eval()
-    if hasattr(torch, "compile"):
-        try:
-            _glm_model = torch.compile(_glm_model, mode="reduce-overhead")
-            log.info("GLM-OCR: torch.compile applied ✓")
-        except Exception as e:
-            log.warning(f"torch.compile skipped: {e}")
+    log.info(f"  VRAM after GLM load:  {_vram_used_gb():.2f} GB used")
     log.info("GLM-OCR ready ✓")
+
+def _vram_used_gb() -> float:
+    import torch
+    if not torch.cuda.is_available():
+        return 0.0
+    free_b, total_b = torch.cuda.mem_get_info(0)
+    return (total_b - free_b) / 1e9
 
 def load_model():
     _load_qwen()
@@ -260,14 +276,13 @@ def _parse_with_glm_plus_qwen(pdf_path: str) -> list:
 
 
 def _glm_ocr_batch(images: list) -> list:
-    """
-    True batched GLM-OCR: process all page images in a single GPU forward pass.
-    Much faster than serial since it amortizes KV-cache prefill overhead.
-    """
     import torch
     _load_glm()
 
-    # Build per-image message lists
+    device = next(_glm_model.parameters()).device
+    log.info(f"[glm-batch] Model device: {device}")
+    assert str(device) != "cpu", "GLM model is on CPU! Check device_map='auto' and VRAM."
+
     all_messages = [
         [{"role": "user", "content": [
             {"type": "image", "image": img},
@@ -276,30 +291,37 @@ def _glm_ocr_batch(images: list) -> list:
         for img in images
     ]
 
-    # Tokenize all pages — padding="longest" pads to match the longest page
+    log.info(f"[glm-batch] Tokenizing {len(images)} pages...")
+    t_tok = time.time()
     inputs = _glm_processor.apply_chat_template(
-        all_messages,           # list of message-lists → batched
+        all_messages,
         tokenize=True,
         add_generation_prompt=True,
         return_dict=True,
         return_tensors="pt",
-        padding=True,           # ✅ batch padding
-    ).to(_glm_model.device)
+        padding=True,
+    ).to(device)
     inputs.pop("token_type_ids", None)
+    log.info(f"[glm-batch] Tokenized in {time.time()-t_tok:.1f}s  input_ids shape: {inputs['input_ids'].shape}")
 
-    # Estimate max tokens from the tallest image in the batch
+    # Log VRAM before generation
+    log.info(f"[glm-batch] VRAM before generate: {_vram_used_gb():.2f} GB")
+
     max_new = max(_estimate_max_tokens(img) for img in images)
-    log.info(f"[glm-batch] {len(images)} pages, max_new_tokens={max_new}")
+    log.info(f"[glm-batch] Generating — max_new_tokens={max_new}")
 
     t0 = time.time()
     with torch.no_grad():
         generated_ids = _glm_model.generate(
             **inputs,
             max_new_tokens=max_new,
+            do_sample=False,          # greedy — fastest
+            use_cache=True,           # ✅ enable KV cache
         )
-    log.info(f"[glm-batch] done in {time.time()-t0:.1f}s")
+    elapsed = time.time() - t0
+    log.info(f"[glm-batch] done in {elapsed:.1f}s  output shape: {generated_ids.shape}")
+    log.info(f"[glm-batch] VRAM after generate: {_vram_used_gb():.2f} GB")
 
-    # Decode each page separately
     input_len = inputs["input_ids"].shape[1]
     results = []
     for i in range(len(images)):
@@ -307,6 +329,7 @@ def _glm_ocr_batch(images: list) -> list:
             generated_ids[i][input_len:],
             skip_special_tokens=False,
         ).strip()
+        log.info(f"[glm-batch] page-{i+1} decoded: {len(text)} chars")
         results.append(text)
     return results
 

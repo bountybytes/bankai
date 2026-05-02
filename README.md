@@ -604,6 +604,7 @@ hf download zai-org/GLM-OCR \
   ls -lh /workspace/models >>> qwen2.5-coder-14b-instruct-q4_k_m.gguf
                                 GLM-OCR/
 cd /worksapce/bankai
+
 pip install \
   transformers \
   accelerate \
@@ -613,9 +614,22 @@ pip install \
   pillow \
   einops \
   safetensors
+
 pip install bitsandbytes
 pip install -r requirements.txt
+
 pip install flash-attn --no-build-isolation
+
+check in terminal if llama-cpp was compiled with CUDA:
+
+# bash
+python -c "import llama_cpp; print(llama_cpp.__file__)"
+# Then check:
+python -c "from llama_cpp import llama_supports_gpu_offload; print('GPU offload:', llama_supports_gpu_offload())"
+If it prints False, your llama-cpp was installed without CUDA support. Reinstall it:
+
+# bash
+CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 
