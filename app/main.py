@@ -95,12 +95,16 @@ def _run_pipeline(pdf_bytes: bytes, filename: str) -> dict:
     anon_header_text, restore_map2 = anonymize_sensitive(header_raw_text)
     restore_map.update(restore_map2)
 
-    # Stage 4a — Qwen: account header from plain page-1 text
+    # Stage 4a — Qwen: account header
     log.info(f"[{req_id}] Parsing header with Qwen ...")
-    acc_details = parse_header(anon_header_text)         # ← uses plain text now
+    acc_details = parse_header(anon_header_text)
     acc_details = restore_sensitive(acc_details, restore_map)
 
-    # Stage 4b — GLM-OCR: transactions from page images
+    # ✅ Free KV cache residue before GLM-OCR
+    from app.parser import _offload_qwen_to_cpu
+    _offload_qwen_to_cpu()
+
+    # Stage 4b — GLM-OCR: transactions
     log.info(f"[{req_id}] Parsing transactions with GLM-OCR ...")
     transactions = parse_transactions(anon_text, pdf_path=tmp_path)
     transactions = [restore_sensitive(t, restore_map) for t in transactions]
@@ -143,6 +147,17 @@ def _run_pipeline(pdf_bytes: bytes, filename: str) -> dict:
             "total_s":           total_s,
         },
     }
+
+def _offload_qwen_to_cpu():
+    """Temporarily move Qwen KV cache pressure off GPU before GLM-OCR."""
+    import torch, gc
+    # llama-cpp doesn't expose device move, but clearing CUDA cache frees
+    # reserved-but-unallocated pages that accumulate after Qwen inference
+    torch.cuda.empty_cache()
+    gc.collect()
+    free_b, total_b = torch.cuda.mem_get_info(0)
+    log.info(f"[vram-cleanup] After Qwen: {(total_b-free_b)/1e9:.2f} GB used, {free_b/1e9:.2f} GB free")
+    
 
 
 # ── POST /parse/submit  (RECOMMENDED — async, no timeout) ─────────────────────

@@ -243,25 +243,25 @@ def parse_transactions(text: str, pdf_path: str = None) -> list:
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def _parse_with_glm_plus_qwen(pdf_path: str) -> list:
-    import fitz
+    import fitz, torch
     doc = fitz.open(pdf_path)
     n_pages = len(doc)
     doc.close()
     log.info(f"[pipeline] GLM-OCR + Qwen — {n_pages} pages")
 
-    # ── Phase 1: Render all pages to PIL Images (CPU, fast) ──
     images = [_render_page(pdf_path, i) for i in range(n_pages)]
 
-    # ── Phase 2: Batch all pages through GLM-OCR in one forward pass ──
-    # Build all inputs first, then generate together (true batching)
     ocr_results = [None] * n_pages
     try:
         ocr_results = _glm_ocr_batch(images)
     except Exception as e:
-        log.warning(f"[pipeline] Batch OCR failed ({e}), falling back to serial")
+        log.warning(f"[pipeline] Batch OCR failed ({e}), clearing CUDA cache and falling back to serial")
+        # ✅ CRITICAL: clear poisoned CUDA state before retrying
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        import gc; gc.collect()
         ocr_results = [_glm_ocr_page_from_image(img, i) for i, img in enumerate(images)]
 
-    # ── Phase 3: Qwen parses each page's OCR text (serial, GGUF) ──
     all_txns = []
     for page_num, ocr_text in enumerate(ocr_results):
         label = f"page-{page_num+1}/{n_pages}"
@@ -273,7 +273,6 @@ def _parse_with_glm_plus_qwen(pdf_path: str) -> list:
 
     log.info(f"[pipeline] DONE — {len(all_txns)} transactions")
     return all_txns
-
 
 def _glm_ocr_batch(images: list) -> list:
     import torch
